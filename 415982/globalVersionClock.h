@@ -4,13 +4,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 
-#if defined(__GNUC__) || defined(__clang__)
-#define TL2_CACHE_ALIGNED __attribute__((aligned(64)))
-#else
-#define TL2_CACHE_ALIGNED
-#endif
-
-typedef struct TL2_CACHE_ALIGNED tl2_version_clock
+typedef struct
 {
     atomic_uint_least64_t value;
 } tl2_version_clock;
