@@ -46,7 +46,6 @@ typedef struct segment_node *segment_list;
  */
 struct region
 {
-    // struct shared_lock_t lock; // Global (coarse-grained) lock
     void *start;         // Start of the shared memory region (i.e., of the non-deallocable memory segment)
     segment_list allocs; // Shared memory segments dynamically allocated via tm_alloc within transactions
     size_t size;         // Size of the non-deallocable memory segment (in bytes)
@@ -62,8 +61,36 @@ struct region
  **/
 shared_t tm_create(size_t unused(size), size_t unused(align))
 {
-    // TODO: tm_create(size_t, size_t)
-    return invalid_shared;
+    // allocate the region structure
+    struct region *region = (struct region *)malloc(sizeof(struct region));
+    if (unlikely(!region))
+    {
+        return invalid_shared;
+    }
+
+    // allocate the shared memory buffer such that its words are correctly aligned
+    if (posix_memalign(&(region->start), align, size) != 0)
+    {
+        free(region);
+        return invalid_shared;
+    }
+
+    // initialize the components of the region structure
+    memset(region->start, 0, size);
+    region->size = size;
+    region->align = align;
+
+    // initialize the list of allocated segs
+    segment_list result = alloc_segment_list();
+    if (result == NULL)
+    {
+        free(region->start);
+        free(region);
+        return invalid_shared;
+    }
+    region->allocs = result;
+
+    return region;
 }
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
@@ -71,7 +98,15 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
  **/
 void tm_destroy(shared_t unused(shared))
 {
-    // TODO: tm_destroy(shared_t)
+    struct region *region = (struct region *)shared;
+    while (region->allocs)
+    {
+        segment_list tail = region->allocs->next;
+        free(region->allocs);
+        region->allocs = tail;
+    }
+    free(region->start);
+    free(region);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -80,8 +115,7 @@ void tm_destroy(shared_t unused(shared))
  **/
 void *tm_start(shared_t unused(shared))
 {
-    // TODO: tm_start(shared_t)
-    return NULL;
+    return ((struct region *)shared)->start;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -90,8 +124,7 @@ void *tm_start(shared_t unused(shared))
  **/
 size_t tm_size(shared_t unused(shared))
 {
-    // TODO: tm_size(shared_t)
-    return 0;
+    return ((struct region *)shared)->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -100,8 +133,7 @@ size_t tm_size(shared_t unused(shared))
  **/
 size_t tm_align(shared_t unused(shared))
 {
-    // TODO: tm_align(shared_t)
-    return 0;
+    return ((struct region *)shared)->align;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -111,7 +143,7 @@ size_t tm_align(shared_t unused(shared))
  **/
 tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
 {
-    // TODO: tm_begin(shared_t)
+    // TODO: aplicar logica do TL2
     return invalid_tx;
 }
 
@@ -122,7 +154,7 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
  **/
 bool tm_end(shared_t unused(shared), tx_t unused(tx))
 {
-    // TODO: tm_end(shared_t, tx_t)
+    // TODO: aplicar logica do TL2
     return false;
 }
 
@@ -136,8 +168,9 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
  **/
 bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
 {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    // TODO: aplicar logica do TL2
+    memcpy(target, source, size);
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -150,8 +183,9 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source
  **/
 bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
 {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    // TODO: aplicar logica do TL2
+    memcpy(target, source, size);
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
@@ -163,8 +197,24 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(sourc
  **/
 alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void **unused(target))
 {
-    // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
-    return abort_alloc;
+    size_t align = ((struct region *)shared)->align;
+    align = align < sizeof(struct segment_node *) ? sizeof(void *) : align;
+
+    struct segment_node *sn;
+    if (unlikely(posix_memalign((void **)&sn, align, sizeof(struct segment_node) + size) != 0)) // Allocation failed
+        return nomem_alloc;
+
+    // Insert in the linked list
+    sn->prev = NULL;
+    sn->next = ((struct region *)shared)->allocs;
+    if (sn->next)
+        sn->next->prev = sn;
+    ((struct region *)shared)->allocs = sn;
+
+    void *segment = (void *)((uintptr_t)sn + sizeof(struct segment_node));
+    memset(segment, 0, size);
+    *target = segment;
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -175,6 +225,30 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
  **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
 {
-    // TODO: tm_free(shared_t, tx_t, void*)
-    return false;
+    struct segment_node *sn = (struct segment_node *)((uintptr_t)target - sizeof(struct segment_node));
+
+    if (sn->prev)
+        sn->prev->next = sn->next;
+    else
+        ((struct region *)shared)->allocs = sn->next;
+    if (sn->next)
+        sn->next->prev = sn->prev;
+
+    free(sn);
+    return true;
+}
+
+///////////// helper functions /////////////
+
+segment_list alloc_segment_list()
+{
+    segment_list list = (segment_list)malloc(sizeof(struct segment_node));
+    if (unlikely(!list))
+    {
+        return NULL;
+    }
+    list->next = NULL;
+    list->prev = NULL;
+    // TODO: add other fields, not sure what they are
+    return list;
 }
