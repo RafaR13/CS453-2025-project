@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 // Internal headers
 #include <tm.h>
@@ -33,34 +34,35 @@
 
 // structures and types --------------------------------------------------------
 
-// TODO: correct word size
-typedef uint32_t txid_t;
-
-// control structure for the shared memory region
 typedef struct
 {
-    _Atomic uint32_t flags; // flags: bit0=readable_is_B, bit1=written_this_epoch, bit2=listed (na write list)
-    _Atomic txid_t owner;   // transaction ID of the writer (0 if none)
-} ctrl_t;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
 
-typedef struct
-{
-    // TODO: verificar o tamanho da word e trocar "uint64_t"
-    uint64_t copy_A; // readable
-    uint64_t copy_B; // writable
-} word_t;
+    uint32_t counter;   // current epoch
+    uint32_t remaining; // number of active transactions
+    uint32_t waiting;   // threads waiting
+} batcher;
 
 typedef struct segment_node
 {
     struct segment_node *next;
     struct segment_node *prev;
 
-    size_t bytes; // size (bytes) of the segment
+    size_t size;  // size (bytes) of the segment
     size_t words; // bytes / align
     size_t align; // size of a word (bytes)
 
-    word_t *data; // array of words
-    ctrl_t *ctrl; // array of control structs
+    // actual data
+    uint8_t *copyA;
+    uint8_t *copyB;
+
+    // control (TODO: merge with bit fields)
+    _Atomic bool readable_copy;       // 0 if A, 1 if B
+    _Atomic bool has_read_or_written; // basically the "access set"
+    _Atomic bool written_this_epoch;  // true if written in this epoch
+    _Atomic uint32_t txid;            // transaction ID of the writer (0 if none)
+
 } segment_node;
 
 typedef struct segment_node *segment_list;
@@ -68,8 +70,7 @@ typedef struct segment_node *segment_list;
 typedef struct region
 {
     // batcher stuff
-    _Atomic uint32_t epoch;  // current epoch
-    _Atomic uint32_t active; // number of active transactions
+    batcher batcher;
 
     // write list stuff (global por agora -- so para o segmento base)
     _Atomic size_t wl_size; // nº de entradas validas
@@ -80,7 +81,9 @@ typedef struct region
 
     segment_list allocs; // list of dynamically allocated segments
 
+    void *start;  // start of the shared memory region
     size_t align; // size of a word
+    size_t size;  // size of the base segment
 } region;
 
 enum
@@ -95,8 +98,116 @@ typedef struct
     bool is_ro;
     bool aborted;
     uint32_t epoch;
-    txid_t id;
+    uint32_t id;
 } txrecord;
+
+// -----------------------------------------------------------------------------
+
+// batcher stuff ---------------------------------------------------------------
+// these functions should be atomic
+uint32_t get_epoch(batcher *bat)
+{
+    // can only be called by a thread after it entered the batcher, and before it left
+    pthread_mutex_lock(&bat->lock);
+    uint32_t epoch = bat->counter;
+    pthread_mutex_unlock(&bat->lock);
+    return epoch;
+}
+void enter(batcher *bat)
+{
+    pthread_mutex_lock(&bat->lock);
+    if (bat->remaining == 0)
+    {
+        bat->remaining = 1;
+        pthread_mutex_unlock(&bat->lock);
+        return;
+    }
+
+    // didnt work, wait for next batch
+    bat->waiting++;
+    uint32_t my_epoch = bat->counter;
+    do
+    {
+        pthread_cond_wait(&bat->cond, &bat->lock);
+    } while (my_epoch == bat->counter);
+    pthread_mutex_unlock(&bat->lock);
+}
+void leave(batcher *bat)
+{
+    pthread_mutex_lock(&bat->lock);
+    bat->remaining--;
+    if (bat->remaining == 0)
+    {
+        bat->counter++;
+        bat->remaining = bat->waiting;
+        bat->waiting = 0;
+        pthread_cond_broadcast(&bat->cond);
+    }
+    pthread_mutex_unlock(&bat->lock);
+}
+
+void batcher_init(batcher *bat)
+{
+    pthread_mutex_init(&bat->lock, NULL);
+    pthread_cond_init(&bat->cond, NULL);
+    bat->counter = 0;
+    bat->remaining = 0;
+    bat->waiting = 0;
+}
+void batcher_destroy(batcher *bat)
+{
+    pthread_mutex_destroy(&bat->lock);
+    pthread_cond_destroy(&bat->cond);
+}
+
+// -----------------------------------------------------------------------------
+
+// helper functions ------------------------------------------------------------
+
+txrecord *get_transaction_record(tx_t tx) { return (txrecord *)(uintptr_t)tx; }
+
+bool read_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), unused(void *target))
+{
+    txrecord *t = get_transaction_record(tx);
+    if (t->is_ro)
+    {
+        // read the readable copy into target
+        return true;
+    }
+    if (1 /* the word has been written in the current epoch*/)
+    {
+        if (1 /* this transaction is already in the "access set" */)
+        {
+            // read the writable copy into target
+            return true;
+        }
+        return false; // abort transaction
+    }
+    // read the readable copy into target
+    // add the transaction to the "access set" if not there already
+    return true;
+}
+bool write_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), unused(void const *source))
+{
+    txrecord *t = get_transaction_record(tx);
+    if (1 /* the word has been written in the current epoch*/)
+    {
+        if (1 /* this transaction is already in the "access set" */)
+        {
+            // write the content at source into the writable copy
+            return true;
+        }
+        return false; // abort transaction
+    }
+    if (1 /* at least one other transaction is in the "access set"*/)
+    {
+        return false; // abort transaction
+    }
+    // write the content at source into the writable copy
+    // add the transaction to the "access set" if not there already
+    // mark the word as written in this epoch
+    return true;
+}
 
 // -----------------------------------------------------------------------------
 
@@ -108,8 +219,47 @@ typedef struct
 shared_t
 tm_create(size_t unused(size), size_t unused(align))
 {
-    // TODO: tm_create(size_t, size_t)
-    return invalid_shared;
+
+    region *region = (struct region *)malloc(sizeof(region));
+    if (unlikely(!region))
+    {
+        return invalid_shared;
+    }
+
+    // check if alignment is a power of 2 and size is a positive multiple of the alignment
+    if (align == 0 || (align & (align - 1)) != 0 || size % align != 0)
+    {
+        free(region);
+        return invalid_shared;
+    }
+
+    if (posix_memalign(&(region->start), align, size) != 0)
+    {
+        free(region);
+        return invalid_shared;
+    }
+
+    region->align = align;
+    region->size = size;
+
+    // initialize base segment
+    region->base.align = align;
+    region->base.size = size;
+    region->base.words = size / align;
+    /*region->base.data = aligned_alloc(64, region->base.words * sizeof(word_t));
+    region->base.ctrl = aligned_alloc(64, region->base.words * sizeof(ctrl_t));
+    if (unlikely(!region->base.data || !region->base.ctrl))
+    {
+        free(region->base.data);
+        free(region->base.ctrl);
+        free(region);
+        return invalid_shared;
+    }*/
+
+    // TODO: initialize the base segment, epoch, write list, etc
+
+    region->allocs = NULL;
+    return region;
 }
 
 /** Destroy (i.e. clean-up + free) a given shared memory region.
@@ -126,8 +276,7 @@ void tm_destroy(shared_t unused(shared))
  **/
 void *tm_start(shared_t unused(shared))
 {
-    // TODO: tm_start(shared_t)
-    return NULL;
+    return ((struct region *)shared)->start;
 }
 
 /** [thread-safe] Return the size (in bytes) of the first allocated segment of the shared memory region.
@@ -136,8 +285,7 @@ void *tm_start(shared_t unused(shared))
  **/
 size_t tm_size(shared_t unused(shared))
 {
-    // TODO: tm_size(shared_t)
-    return 0;
+    return ((struct region *)shared)->size;
 }
 
 /** [thread-safe] Return the alignment (in bytes) of the memory accesses on the given shared memory region.
@@ -146,8 +294,7 @@ size_t tm_size(shared_t unused(shared))
  **/
 size_t tm_align(shared_t unused(shared))
 {
-    // TODO: tm_align(shared_t)
-    return 0;
+    return ((struct region *)shared)->align;
 }
 
 /** [thread-safe] Begin a new transaction on the given shared memory region.
@@ -182,8 +329,19 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
  **/
 bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
 {
-    // TODO: tm_read(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    // TODO (checks): size must be positive multiple of alignment
+    // source and target must be at least size bytes long
+    // source and target addresses must be a positive multiple of alignment
+
+    // for each word index within [source, source + size[
+    for (int i = 0;;)
+    {
+        if (!read_word(shared, tx, i, target /*+ offset*/))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** [thread-safe] Write operation in the given transaction, source in a private region and target in the shared region.
@@ -196,8 +354,19 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source
  **/
 bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
 {
-    // TODO: tm_write(shared_t, tx_t, void const*, size_t, void*)
-    return false;
+    // TODO (checks): size must be positive multiple of alignment
+    // source and target must be at least size bytes long
+    // source and target addresses must be a positive multiple of alignment
+
+    // for each word index within [target, target+size[
+    for (int i = 0;;)
+    {
+        if (!write_word(shared, tx, i, source /*+ offset*/))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 /** [thread-safe] Memory allocation in the given transaction.
@@ -210,7 +379,14 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(sourc
 alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void **unused(target))
 {
     // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
-    return abort_alloc;
+
+    // allocate enough space for a segment of size size
+    // if allocation fails, return abort_alloc
+
+    // initialize the control structure(s) (one per word) in the segment;
+    // initialize each copy of each word in the segment to zeroes;
+    // register the segment in the set of allocated segments;
+    return 0;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -222,5 +398,19 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
 {
     // TODO: tm_free(shared_t, tx_t, void*)
-    return false;
+
+    // mark target for deregistering (from the set of allocated segments)
+    // and freeing once the last transaction of the current epoch leaves
+    // the Batcher, if the calling transaction ends up being committed;
+
+    return true;
+}
+
+bool commit()
+{
+    // for each written word index:
+    //      defer the swap, of which copy for word index is the “valid”
+    //      copy, just after the last transaction from the current epoch
+    //      leaves the Batcher and before the next batch starts running;
+    return true;
 }
