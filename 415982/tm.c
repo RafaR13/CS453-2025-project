@@ -44,6 +44,14 @@ typedef struct
     uint32_t waiting;   // threads waiting
 } batcher;
 
+typedef struct
+{
+    _Atomic bool readable_copy;       // 0 if A, 1 if B
+    _Atomic bool has_read_or_written; // basically the "access set"
+    _Atomic bool written_this_epoch;  // true if written in this epoch
+    _Atomic uint32_t txid;            // transaction ID of the writer (0 if none)
+} ctrl;
+
 typedef struct segment_node
 {
     struct segment_node *next;
@@ -57,11 +65,8 @@ typedef struct segment_node
     uint8_t *copyA;
     uint8_t *copyB;
 
-    // control (TODO: merge with bit fields)
-    _Atomic bool readable_copy;       // 0 if A, 1 if B
-    _Atomic bool has_read_or_written; // basically the "access set"
-    _Atomic bool written_this_epoch;  // true if written in this epoch
-    _Atomic uint32_t txid;            // transaction ID of the writer (0 if none)
+    // control
+    ctrl *control;
 
 } segment_node;
 
@@ -209,6 +214,16 @@ bool write_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), u
     return true;
 }
 
+inline uint8_t *readable_ptr(segment_node *seg, size_t index, bool readable_copy)
+{
+    return readable_copy ? (seg->copyB + index * seg->align) : (seg->copyA + index * seg->align);
+}
+
+inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readable_copy)
+{
+    return readable_copy ? (seg->copyA + index * seg->align) : (seg->copyB + index * seg->align);
+}
+
 // -----------------------------------------------------------------------------
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -219,6 +234,12 @@ bool write_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), u
 shared_t
 tm_create(size_t unused(size), size_t unused(align))
 {
+    if (!is_power_of_2(align))
+        return invalid_shared;
+    if (size == 0 || size % align != 0)
+        return invalid_shared;
+    if (size > (1ULL << 48))
+        return invalid_shared;
 
     region *region = (struct region *)malloc(sizeof(region));
     if (unlikely(!region))
@@ -226,39 +247,69 @@ tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
 
-    // check if alignment is a power of 2 and size is a positive multiple of the alignment
-    if (align == 0 || (align & (align - 1)) != 0 || size % align != 0)
+    region->align = align;
+    region->size = size;
+
+    // initialize base segment
+    segment_node *base = &region->base;
+    base->align = align;
+    base->size = size;
+    base->words = size / align;
+
+    // allocate the 2 copies and control struct
+    if (posix_memalign((void **)&(base->copyA), align, size) != 0)
     {
         free(region);
         return invalid_shared;
     }
-
     if (posix_memalign(&(region->start), align, size) != 0)
     {
         free(region);
         return invalid_shared;
     }
-
-    region->align = align;
-    region->size = size;
-
-    // initialize base segment
-    region->base.align = align;
-    region->base.size = size;
-    region->base.words = size / align;
-    /*region->base.data = aligned_alloc(64, region->base.words * sizeof(word_t));
-    region->base.ctrl = aligned_alloc(64, region->base.words * sizeof(ctrl_t));
-    if (unlikely(!region->base.data || !region->base.ctrl))
+    if (posix_memalign((void **)&(base->copyB), align, size) != 0)
     {
-        free(region->base.data);
-        free(region->base.ctrl);
+        free(base->copyA);
         free(region);
         return invalid_shared;
-    }*/
+    }
+    if (posix_memalign((void **)&(base->control), sizeof(void *), sizeof(ctrl) * base->words) != 0)
+    {
+        free(base->copyA);
+        free(base->copyB);
+        free(region);
+        return invalid_shared;
+    }
 
-    // TODO: initialize the base segment, epoch, write list, etc
+    // initialize the data with 0s and initialize the control struct
+    memset(base->copyA, 0, base->words * align);
+    memset(base->copyB, 0, base->words * align);
+    for (size_t i = 0; i < base->words; i++)
+    {
+        atomic_init(&base->control[i].readable_copy, false);
+        atomic_init(&base->control[i].has_read_or_written, false);
+        atomic_init(&base->control[i].written_this_epoch, false);
+        atomic_init(&base->control[i].txid, 0);
+    }
 
+    // initialize write list
+    region->wl_capacity = base->words; // TODO: check
+    region->write_list = (size_t *)malloc(region->wl_capacity * sizeof(size_t));
+    if (!region->write_list)
+    {
+        free(base->control);
+        free(base->copyA);
+        free(base->copyB);
+        free(region);
+        return invalid_shared;
+    }
+    atomic_init(&region->wl_size, 0);
+
+    // initialize batcher
+    batcher_init(&region->batcher);
+    region->start = (void *)base->copyA;
     region->allocs = NULL;
+
     return region;
 }
 
@@ -267,7 +318,27 @@ tm_create(size_t unused(size), size_t unused(align))
  **/
 void tm_destroy(shared_t unused(shared))
 {
-    // TODO: tm_destroy(shared_t)
+    struct region *region = (struct region *)shared;
+    // free all segments
+    while (region->allocs)
+    {
+        segment_list next = region->allocs->next;
+        free(region->allocs->control);
+        free(region->allocs->copyA);
+        free(region->allocs->copyB);
+        free(region->allocs);
+        region->allocs = next;
+    }
+    // write list
+    free(region->write_list);
+    // batcher
+    batcher_destroy(&region->batcher);
+    // base segment
+    free(region->base.control);
+    free(region->base.copyA);
+    free(region->base.copyB);
+    // region
+    free(region);
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
