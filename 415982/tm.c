@@ -85,6 +85,7 @@ typedef struct region
     segment_node base; // base segment (non-freeable)
 
     segment_list allocs; // list of dynamically allocated segments
+    segment_list pending_free;
 
     void *start;  // start of the shared memory region
     size_t align; // size of a word
@@ -245,6 +246,29 @@ void wl_append(region *reg, size_t idx)
         reg->write_list[position] = idx;
 }
 
+segment_node *find_segment(region *r, void *p)
+{
+    if (r->base.copyA == (uint8_t *)p)
+        return &r->base;
+    for (segment_node *sn = r->allocs; sn; sn = sn->next)
+        if (sn->copyA == (uint8_t *)p)
+            return sn;
+    return NULL;
+}
+
+void free_segment_node(segment_node *sn)
+{
+    free(sn->control);
+    free(sn->copyA);
+    free(sn->copyB);
+    free(sn);
+}
+
+void epoch_boundary(region *unused(r))
+{
+    // TODO
+}
+
 // -----------------------------------------------------------------------------
 _Thread_local txrecord transaction;
 
@@ -325,6 +349,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     batcher_init(&region->batcher);
     region->start = (void *)base->copyA;
     region->allocs = NULL;
+    region->pending_free = NULL;
 
     return region;
 }
@@ -535,7 +560,71 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
     // initialize the control structure(s) (one per word) in the segment;
     // initialize each copy of each word in the segment to zeroes;
     // register the segment in the set of allocated segments;
-    return 0;
+
+    region *r = (region *)shared;
+    if (!r || !target)
+        return abort_alloc;
+    if (size == 0 || (size % r->align) != 0)
+        return abort_alloc;
+
+    size_t align = ((struct region *)shared)->align;
+    size_t words = size / align;
+
+    // data segment
+    struct segment_node *sn = (struct segment_node *)malloc(sizeof(struct segment_node));
+    if (unlikely(!sn))
+        return nomem_alloc;
+    sn->size = size;
+    sn->words = words;
+    sn->align = align;
+
+    // copies
+    size_t data = align < sizeof(void *) ? sizeof(void *) : align; // sizeof(segment) or void*
+    if (posix_memalign((void **)&sn->copyA, data, size) != 0)
+    {
+        free(sn);
+        return nomem_alloc;
+    }
+    if (posix_memalign((void **)&sn->copyB, data, size) != 0)
+    {
+
+        free(sn->copyA);
+        free(sn);
+        return nomem_alloc;
+    }
+
+    // control
+    size_t ctrl = sizeof(void *);
+    if (posix_memalign((void **)&sn->control, ctrl, sizeof(ctrl) * words) != 0)
+    {
+        free(sn->copyA);
+        free(sn->copyB);
+        free(sn);
+        return nomem_alloc;
+    }
+
+    // zero the data
+    memset(sn->copyA, 0, size);
+    memset(sn->copyB, 0, size);
+    for (size_t i = 0; i < words; i++)
+    {
+        atomic_init(&sn->control[i].readable_copy, false);
+        atomic_init(&sn->control[i].has_read_or_written, false);
+        atomic_init(&sn->control[i].written_this_epoch, false);
+        atomic_init(&sn->control[i].txid, 0);
+    }
+
+    pthread_mutex_lock(&r->batcher.lock);
+    sn->prev = NULL;
+    sn->next = r->allocs;
+    if (sn->next)
+        sn->next->prev = sn;
+    r->allocs = sn;
+    pthread_mutex_unlock(&r->batcher.lock);
+
+    *target = (void *)sn->copyA;
+
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -551,6 +640,35 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
     // mark target for deregistering (from the set of allocated segments)
     // and freeing once the last transaction of the current epoch leaves
     // the Batcher, if the calling transaction ends up being committed;
+
+    region *r = (region *)shared;
+    (void)tx;
+    if (!r || !target)
+        return false;
+
+    pthread_mutex_lock(&r->batcher.lock);
+    segment_node *sn = find_segment(r, target);
+    if (!sn || sn == &r->base)
+    {
+        pthread_mutex_unlock(&r->batcher.lock);
+        return false;
+    }
+
+    // unlink
+    if (sn->prev)
+        sn->prev->next = sn->next;
+    else
+        r->allocs = sn->next;
+    if (sn->next)
+        sn->next->prev = sn->prev;
+    sn->prev = sn->next = NULL;
+
+    // add to pending
+    sn->next = r->pending_free;
+    if (r->pending_free)
+        r->pending_free->prev = sn;
+    r->pending_free = sn;
+    pthread_mutex_unlock(&r->batcher.lock);
 
     return true;
 }
