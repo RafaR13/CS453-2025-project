@@ -171,9 +171,8 @@ void batcher_destroy(batcher *bat)
 
 txrecord *get_transaction_record(tx_t tx) { return (txrecord *)(uintptr_t)tx; }
 
-bool read_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), unused(void *target))
+bool read_word(region *unused(r), txrecord *t, size_t unused(index), void *unused(target))
 {
-    txrecord *t = get_transaction_record(tx);
     if (t->is_ro)
     {
         // read the readable copy into target
@@ -192,9 +191,9 @@ bool read_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), un
     // add the transaction to the "access set" if not there already
     return true;
 }
-bool write_word(shared_t unused(shared), tx_t unused(tx), unused(void *index), unused(void const *source))
+bool write_word(region *unused(r), txrecord *unused(tx), size_t unused(index), void const *unused(source))
 {
-    txrecord *t = get_transaction_record(tx);
+    // txrecord *t = get_transaction_record(tx);
     if (1 /* the word has been written in the current epoch*/)
     {
         if (1 /* this transaction is already in the "access set" */)
@@ -224,15 +223,37 @@ inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readable_copy
     return readable_copy ? (seg->copyA + index * seg->align) : (seg->copyB + index * seg->align);
 }
 
+inline int is_power_of_2(size_t x) { return x && ((x & (x - 1)) == 0); }
+
+// returns the index of the word corresponding to the address
+bool base_addr_to_index(region *R, void const *addr, size_t *out_idx)
+{
+    const segment_node *S = &R->base;
+    uintptr_t a = (uintptr_t)addr;
+    uintptr_t beg = (uintptr_t)S->copyA;
+    uintptr_t end = beg + S->size; // size == words*align
+    if (a < beg || a >= end)
+        return false;
+    *out_idx = (a - beg) / S->align;
+    return true;
+}
+
+void wl_append(region *reg, size_t idx)
+{
+    size_t position = atomic_fetch_add_explicit(&reg->wl_size, 1, memory_order_acq_rel);
+    if (position < reg->wl_capacity)
+        reg->write_list[position] = idx;
+}
+
 // -----------------------------------------------------------------------------
+_Thread_local txrecord transaction;
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
  * @param align Alignment (in bytes, must be a power of 2) that the shared memory region must support
  * @return Opaque shared memory region handle, 'invalid_shared' on failure
  **/
-shared_t
-tm_create(size_t unused(size), size_t unused(align))
+shared_t tm_create(size_t unused(size), size_t unused(align))
 {
     if (!is_power_of_2(align))
         return invalid_shared;
@@ -241,7 +262,7 @@ tm_create(size_t unused(size), size_t unused(align))
     if (size > (1ULL << 48))
         return invalid_shared;
 
-    region *region = (struct region *)malloc(sizeof(region));
+    region *region = (struct region *)malloc(sizeof(struct region));
     if (unlikely(!region))
     {
         return invalid_shared;
@@ -258,11 +279,6 @@ tm_create(size_t unused(size), size_t unused(align))
 
     // allocate the 2 copies and control struct
     if (posix_memalign((void **)&(base->copyA), align, size) != 0)
-    {
-        free(region);
-        return invalid_shared;
-    }
-    if (posix_memalign(&(region->start), align, size) != 0)
     {
         free(region);
         return invalid_shared;
@@ -375,8 +391,19 @@ size_t tm_align(shared_t unused(shared))
  **/
 tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
 {
-    // TODO: tm_begin(shared_t)
-    return invalid_tx;
+    // TODO: what are failure conditions ?
+
+    region *r = (region *)shared;
+
+    txrecord *t = &transaction;
+    t->is_ro = is_ro;
+    t->aborted = false;
+
+    enter(&r->batcher);
+    t->epoch = get_epoch(&r->batcher);
+    t->id = (uint32_t)((uintptr_t)t & 0x7ffffffff);
+
+    return (tx_t)(uintptr_t)t;
 }
 
 /** [thread-safe] End the given transaction.
@@ -386,8 +413,11 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
  **/
 bool tm_end(shared_t unused(shared), tx_t unused(tx))
 {
-    // TODO: tm_end(shared_t, tx_t)
-    return false;
+    region *r = (region *)shared;
+    txrecord *t = get_transaction_record(tx);
+    bool committed = !t->aborted;
+    leave(&r->batcher);
+    return committed;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -404,11 +434,35 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source
     // source and target must be at least size bytes long
     // source and target addresses must be a positive multiple of alignment
 
-    // for each word index within [source, source + size[
-    for (int i = 0;;)
+    region *r = (region *)shared;
+    txrecord *t = get_transaction_record(tx);
+    if (size == 0 || (size % r->align) != 0)
     {
-        if (!read_word(shared, tx, i, target /*+ offset*/))
+        t->aborted = true;
+        return false;
+    }
+
+    size_t index;
+    if (!base_addr_to_index(r, source, &index))
+    {
+        t->aborted = true;
+        return false;
+    }
+
+    size_t n = size / r->align;
+    uint8_t *out = (uint8_t *)target;
+
+    // for each word index within [source, source + size[
+    for (size_t i = 0; i < n; ++i, ++index, out += r->align)
+    {
+        if (index >= r->base.words)
         {
+            t->aborted = true;
+            return false;
+        }
+        if (!read_word(r, t, index, out))
+        {
+            t->aborted = true;
             return false;
         }
     }
@@ -429,11 +483,35 @@ bool tm_write(shared_t unused(shared), tx_t unused(tx), void const *unused(sourc
     // source and target must be at least size bytes long
     // source and target addresses must be a positive multiple of alignment
 
-    // for each word index within [target, target+size[
-    for (int i = 0;;)
+    region *r = (region *)shared;
+    txrecord *t = get_transaction_record(tx);
+    if (size == 0 || (size % r->align != 0))
     {
-        if (!write_word(shared, tx, i, source /*+ offset*/))
+        t->aborted = true;
+        return false;
+    }
+
+    size_t index;
+    if (!base_addr_to_index(r, target, &index))
+    {
+        t->aborted = true;
+        return false;
+    }
+
+    size_t n = size / r->align;
+    uint8_t const *in = (uint8_t const *)source;
+
+    // for each word index within [target, target+size[
+    for (size_t i = 0; i < n; ++i, ++index, in += r->align)
+    {
+        if (index >= r->base.words)
         {
+            t->aborted = true;
+            return false;
+        }
+        if (!write_word(r, t, index, in))
+        {
+            t->aborted = true;
             return false;
         }
     }
