@@ -29,20 +29,11 @@
 
 // Internal headers
 #include <tm.h>
+#include "batcher.h"
 
 #include "macros.h"
 
 // structures and types --------------------------------------------------------
-
-typedef struct
-{
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-
-    uint32_t counter;   // current epoch
-    uint32_t remaining; // number of active transactions
-    uint32_t waiting;   // threads waiting
-} batcher;
 
 typedef struct
 {
@@ -109,65 +100,6 @@ typedef struct
 
 // -----------------------------------------------------------------------------
 
-// batcher stuff ---------------------------------------------------------------
-// these functions should be atomic
-uint32_t get_epoch(batcher *bat)
-{
-    // can only be called by a thread after it entered the batcher, and before it left
-    pthread_mutex_lock(&bat->lock);
-    uint32_t epoch = bat->counter;
-    pthread_mutex_unlock(&bat->lock);
-    return epoch;
-}
-void enter(batcher *bat)
-{
-    pthread_mutex_lock(&bat->lock);
-    if (bat->remaining == 0)
-    {
-        bat->remaining = 1;
-        pthread_mutex_unlock(&bat->lock);
-        return;
-    }
-
-    // didnt work, wait for next batch
-    bat->waiting++;
-    uint32_t my_epoch = bat->counter;
-    do
-    {
-        pthread_cond_wait(&bat->cond, &bat->lock);
-    } while (my_epoch == bat->counter);
-    pthread_mutex_unlock(&bat->lock);
-}
-void leave(batcher *bat)
-{
-    pthread_mutex_lock(&bat->lock);
-    bat->remaining--;
-    if (bat->remaining == 0)
-    {
-        bat->counter++;
-        bat->remaining = bat->waiting;
-        bat->waiting = 0;
-        pthread_cond_broadcast(&bat->cond);
-    }
-    pthread_mutex_unlock(&bat->lock);
-}
-
-void batcher_init(batcher *bat)
-{
-    pthread_mutex_init(&bat->lock, NULL);
-    pthread_cond_init(&bat->cond, NULL);
-    bat->counter = 0;
-    bat->remaining = 0;
-    bat->waiting = 0;
-}
-void batcher_destroy(batcher *bat)
-{
-    pthread_mutex_destroy(&bat->lock);
-    pthread_cond_destroy(&bat->cond);
-}
-
-// -----------------------------------------------------------------------------
-
 // helper functions ------------------------------------------------------------
 
 txrecord *get_transaction_record(tx_t tx) { return (txrecord *)(uintptr_t)tx; }
@@ -177,7 +109,8 @@ bool read_word(region *unused(r), txrecord *t, size_t unused(index), void *unuse
     if (t->is_ro)
     {
         // read the readable copy into target
-        return true;
+        if (1)
+            return true;
     }
     if (1 /* the word has been written in the current epoch*/)
     {
@@ -270,7 +203,6 @@ void epoch_boundary(region *unused(r))
 }
 
 // -----------------------------------------------------------------------------
-_Thread_local txrecord transaction;
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
  * @param size  Size of the first shared segment of memory to allocate (in bytes), must be a positive multiple of the alignment
@@ -420,15 +352,18 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
 
     region *r = (region *)shared;
 
-    txrecord *t = &transaction;
+    txrecord *t = (txrecord *)malloc(sizeof(txrecord));
+    if (unlikely(!t))
+        return invalid_tx;
+
     t->is_ro = is_ro;
     t->aborted = false;
 
-    enter(&r->batcher);
+    enter_batcher(&r->batcher);
     t->epoch = get_epoch(&r->batcher);
     t->id = (uint32_t)((uintptr_t)t & 0x7ffffffff);
 
-    return (tx_t)(uintptr_t)t;
+    return (tx_t)t;
 }
 
 /** [thread-safe] End the given transaction.
@@ -441,7 +376,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     bool committed = !t->aborted;
-    leave(&r->batcher);
+    leave_batcher(&r->batcher);
     return committed;
 }
 
