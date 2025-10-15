@@ -104,25 +104,45 @@ typedef struct
 
 txrecord *get_transaction_record(tx_t tx) { return (txrecord *)(uintptr_t)tx; }
 
-bool read_word(region *unused(r), txrecord *t, size_t unused(index), void *unused(target))
+bool read_word(region *unused(r), txrecord *t, size_t unused(segment_index), size_t unused(word_index), void *unused(target))
 {
+    ctrl *c = &r->allocs[segment_index].control[word_index];
     if (t->is_ro)
     {
         // read the readable copy into target
-        if (1)
-            return true;
+        bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+        memcpy(target, readable_ptr(&r->allocs[segment_index], word_index, readable), r->align);
+        return true;
     }
-    if (1 /* the word has been written in the current epoch*/)
+
+    bool written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+    uint32_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
+    if (written /* the word has been written in the current epoch*/)
     {
-        if (1 /* this transaction is already in the "access set" */)
+        if (owner == t->id /* this transaction is already in the "access set" */)
         {
             // read the writable copy into target
+            bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+            memcpy(target, writable_ptr(&r->allocs[segment_index], word_index, readable), r->align);
             return true;
         }
         return false; // abort transaction
     }
-    // read the readable copy into target
+
+    /*if (owner != t->id) {
+        uint32_t expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(&c->txid, &expected, t->id,
+                                                     memory_order_acq_rel, memory_order_acquire)) {
+            // Another tx has already claimed this word (reader/writer) → abort
+            if (expected != t->id) return false;
+        }
+    }*/
+
     // add the transaction to the "access set" if not there already
+    atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
+    // read the readable copy into target
+    bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+    memcpy(target, readable_ptr(&r->base, index, rc), r->align);
     return true;
 }
 bool write_word(region *unused(r), txrecord *unused(tx), size_t unused(index), void const *unused(source))
@@ -150,11 +170,6 @@ bool write_word(region *unused(r), txrecord *unused(tx), size_t unused(index), v
 inline uint8_t *readable_ptr(segment_node *seg, size_t index, bool readable_copy)
 {
     return readable_copy ? (seg->copyB + index * seg->align) : (seg->copyA + index * seg->align);
-}
-
-inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readable_copy)
-{
-    return readable_copy ? (seg->copyA + index * seg->align) : (seg->copyB + index * seg->align);
 }
 
 inline int is_power_of_2(size_t x) { return x && ((x & (x - 1)) == 0); }
@@ -388,7 +403,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
  * @param target Target start address (in a private region)
  * @return Whether the whole transaction can continue
  **/
-bool tm_read(shared_t unused(shared), tx_t unused(tx), void const *unused(source), size_t unused(size), void *unused(target))
+bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
     // TODO (checks): size must be positive multiple of alignment
     // source and target must be at least size bytes long
