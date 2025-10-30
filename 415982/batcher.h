@@ -15,4 +15,5 @@ void batcher_init(batcher *b);
 void batcher_destroy(batcher *b);
 void enter_batcher(batcher *b);
 void leave_batcher(batcher *b);
+bool leave_batcher2(batcher *bat, void *region);
 uint32_t get_epoch(batcher *b);

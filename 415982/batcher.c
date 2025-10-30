@@ -1,6 +1,9 @@
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include "batcher.h"
+
+void epoch_boundary(void *region);
 
 uint32_t get_epoch(batcher *bat)
 {
@@ -43,6 +46,30 @@ void leave_batcher(batcher *bat)
         pthread_cond_broadcast(&bat->cond);
     }
     pthread_mutex_unlock(&bat->lock);
+}
+
+bool leave_batcher2(batcher *bat, void *region)
+{
+    pthread_mutex_lock(&bat->lock);
+
+    bat->remaining--;
+    if (bat->remaining > 0)
+    {
+        pthread_mutex_unlock(&bat->lock);
+        return false;
+    }
+
+    // im the last
+    bat->counter++;
+    bat->remaining = bat->waiting;
+    bat->waiting = 0;
+
+    if (region)
+        epoch_boundary(region);
+
+    pthread_cond_broadcast(&bat->cond);
+    pthread_mutex_unlock(&bat->lock);
+    return true;
 }
 
 void batcher_init(batcher *bat)

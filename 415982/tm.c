@@ -72,15 +72,21 @@ typedef struct segment_node
 
 typedef struct segment_node *segment_list;
 
+typedef struct
+{
+    uint16_t segment_id;
+    size_t word_index;
+} write_list_item;
+
 typedef struct region
 {
     // batcher stuff
     batcher batcher;
 
     // write list stuff (global por agora -- so para o segmento base)
-    _Atomic size_t wl_size; // nº de entradas validas
-    size_t wl_capacity;     // capacidade do array
-    size_t *write_list;     // array of word indices that were written in this epoch
+    _Atomic size_t wl_size;      // nº de entradas validas
+    size_t wl_capacity;          // capacidade do array
+    write_list_item *write_list; // array of word indices that were written in this epoch
 
     segment_node base; // base segment (non-freeable)
 
@@ -109,6 +115,10 @@ typedef struct
     bool aborted;
     uint32_t epoch;
     uint32_t id;
+
+    uint16_t *segments_to_free;
+    size_t segments_to_free_count;
+    // size_t segments_to_free_capacity;
 } txrecord;
 
 typedef struct
@@ -121,23 +131,30 @@ typedef struct
 
 // helper functions ------------------------------------------------------------
 
-txrecord *get_transaction_record(tx_t tx) { return (txrecord *)(uintptr_t)tx; }
-inline uint8_t *readable_ptr(segment_node *seg, size_t index, bool readable_copy)
+static txrecord *get_transaction_record(tx_t tx) { return (txrecord *)(uintptr_t)tx; }
+
+static inline uint8_t *readable_ptr(segment_node *seg, size_t index, bool readable_copy)
 {
     return readable_copy ? (seg->copyB + index * seg->align) : (seg->copyA + index * seg->align);
 }
 
-inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readable_copy)
+static inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readable_copy)
 {
     return readable_copy ? (seg->copyA + index * seg->align) : (seg->copyB + index * seg->align);
 }
-void wl_append(region *reg, size_t idx)
+
+static void wl_append(region *reg, uint16_t segment_id, size_t word_index)
 {
     size_t position = atomic_fetch_add_explicit(&reg->wl_size, 1, memory_order_acq_rel);
     if (position < reg->wl_capacity)
-        reg->write_list[position] = idx;
+    {
+        reg->write_list[position].segment_id = segment_id;
+        reg->write_list[position].word_index = word_index;
+    }
+    // TODO: a write list pode dar overflow ?
 }
-bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
+
+static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
 {
     ctrl *c = &segment->control[word_index];
     if (t->is_ro)
@@ -178,7 +195,8 @@ bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index,
     memcpy(target, readable_ptr(segment, word_index, rc), r->align);
     return true;
 }
-bool write_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void const *source)
+
+static bool write_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void const *source)
 {
     ctrl *c = &segment->control[word_index];
 
@@ -216,28 +234,28 @@ bool write_word(region *r, txrecord *t, segment_node *segment, size_t word_index
 
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(writable_ptr(segment, word_index, readable), source, r->align);
-    wl_append(r, word_index); // TODO: maybe store the segment and word index
+    wl_append(r, segment->id, word_index);
     return true;
 }
 
-inline int is_power_of_2(size_t x) { return x && ((x & (x - 1)) == 0); }
+static inline int is_power_of_2(size_t x) { return x && ((x & (x - 1)) == 0); }
 
-inline void *encode_pointer(uint16_t segment_id, uint64_t word_index)
+static inline void *encode_pointer(uint16_t segment_id, uint64_t word_index)
 {
     return (void *)(((uint64_t)segment_id << WORD_INDEX_BITS) | (word_index & WORD_INDEX_MASK));
 }
 
-inline uint16_t get_segment_id_from_pointer(const void *ptr)
+static inline uint16_t get_segment_id_from_pointer(const void *ptr)
 {
     return (uint16_t)((uintptr_t)ptr >> WORD_INDEX_BITS);
 }
 
-inline uint64_t get_word_index_from_pointer(const void *ptr)
+static inline uint64_t get_word_index_from_pointer(const void *ptr)
 {
     return (uint64_t)((uintptr_t)ptr & WORD_INDEX_MASK);
 }
 
-bool address_to_segment_and_index(region *r, const void *address, segment_and_index *out)
+static bool address_to_segment_and_index(region *r, const void *address, segment_and_index *out)
 {
     if (!r || !address || !out)
         return false;
@@ -255,6 +273,14 @@ bool address_to_segment_and_index(region *r, const void *address, segment_and_in
     return true;
 }
 
+static bool push_segment_to_free(txrecord *t, uint16_t segment_id)
+{
+    if (!t) // TODO: acho que isto é sempre falso mas yh
+        return false;
+    t->segments_to_free[t->segments_to_free_count++] = segment_id;
+    return true;
+}
+
 // #############################################################
 // | TODO: review |
 // v              v
@@ -268,9 +294,62 @@ void free_segment_node(segment_node *sn)
     free(sn);
 }
 
-void epoch_boundary(region *unused(r))
+void epoch_boundary(void *ctx)
 {
-    // TODO
+    region *r = (region *)ctx;
+
+    // 1) Publicar writes deste epoch
+    size_t n = atomic_exchange_explicit(&r->wl_size, 0, memory_order_acq_rel);
+    for (size_t i = 0; i < n && i < r->wl_capacity; ++i)
+    {
+        uint16_t segid = r->write_list[i].segment_id;
+        size_t idx = r->write_list[i].word_index;
+
+        // pode já não estar na segment_table (se foi deregistered no commit)
+        segment_node *seg = r->segment_table[segid];
+        if (!seg)
+        {
+            // tenta encontrá-lo na pending_free: ainda existe até aqui
+            for (segment_node *p = r->pending_free; p; p = p->next)
+            {
+                if (p->id == segid)
+                {
+                    seg = p;
+                    break;
+                }
+            }
+            if (!seg)
+                continue;
+        }
+
+        ctrl *c = &seg->control[idx];
+        bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+        atomic_store_explicit(&c->readable_copy, !rc, memory_order_release);
+        atomic_store_explicit(&c->written_this_epoch, false, memory_order_release);
+        atomic_store_explicit(&c->has_read_or_written, false, memory_order_release);
+        atomic_store_explicit(&c->txid, 0, memory_order_release);
+    }
+
+    // 2) Libertar segmentos pendentes (deregistered no commit)
+    segment_node *sn = r->pending_free;
+    r->pending_free = NULL;
+    while (sn)
+    {
+        segment_node *next = sn->next;
+        // remove de r->allocs (se manténs esta lista)
+        if (sn->prev)
+            sn->prev->next = sn->next;
+        if (sn->next)
+            sn->next->prev = sn->prev;
+        if (r->allocs == sn)
+            r->allocs = sn->next;
+
+        free(sn->control);
+        free(sn->copyA);
+        free(sn->copyB);
+        free(sn);
+        sn = next;
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -349,7 +428,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
 
     // initialize write list
     region->wl_capacity = base->words; // TODO: check
-    region->write_list = (size_t *)malloc(region->wl_capacity * sizeof(size_t));
+    region->write_list = (write_list_item *)malloc(region->wl_capacity * sizeof(*region->write_list));
     if (!region->write_list)
     {
         free(base->control);
@@ -445,6 +524,8 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
 
     t->is_ro = is_ro;
     t->aborted = false;
+    t->segments_to_free = NULL;
+    t->segments_to_free_count = 0;
 
     enter_batcher(&r->batcher);
     t->epoch = get_epoch(&r->batcher);
@@ -463,7 +544,30 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     bool committed = !t->aborted;
-    leave_batcher(&r->batcher);
+
+    if (committed && t->segments_to_free_count > 0)
+    {
+        pthread_mutex_lock(&r->batcher.lock);
+        for (size_t i = 0; i < t->segments_to_free_count; i++)
+        {
+            uint16_t segment_id = t->segments_to_free[i];
+            segment_node *s = r->segment_table[segment_id];
+            if (!s)
+                continue;
+
+            r->segment_table[segment_id] = NULL;
+
+            s->prev = NULL;
+            s->next = r->pending_free;
+            if (s->next)
+                s->next->prev = s;
+            r->pending_free = s;
+        }
+        pthread_mutex_unlock(&r->batcher.lock);
+    }
+
+    // leave_batcher(&r->batcher);
+    leave_batcher2(&r->batcher, r);
     free(t);
     return committed;
 }
@@ -677,22 +781,19 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
     // the Batcher, if the calling transaction ends up being committed;
 
     region *r = (region *)shared;
-    (void)tx;
-    if (!r || !target)
+    txrecord *t = get_transaction_record(tx);
+    if (!r || !target || !t)
         return false;
 
     uint16_t segment_id = get_segment_id_from_pointer(target);
-    if (segment_id == 0)
+    if (segment_id == 0) // base
         return false;
 
     segment_node *s = r->segment_table[segment_id];
-
     if (!s)
         return false;
 
-    // TODO: marcar para pending free e quando acabar a epoch aí manda se tudo ao lixo
-    // tirar tambem da segment table
-    return true;
+    return push_segment_to_free(t, segment_id);
 }
 
 bool commit()
