@@ -30,7 +30,7 @@
 
 // Internal headers
 #include <tm.h>
-#include "batcher.h"
+// #include "batcher.h"
 
 #include "macros.h"
 
@@ -39,6 +39,7 @@
 #define SEGMENT_ID_MASK (MAX_SEGMENTS - 1u)
 #define WORD_INDEX_BITS 48u
 #define WORD_INDEX_MASK ((1ULL << WORD_INDEX_BITS) - 1ULL)
+#define BITSET_BYTES ((MAX_SEGMENTS + 7u) / 8u)
 
 // structures and types --------------------------------------------------------
 
@@ -49,6 +50,16 @@ typedef struct
     _Atomic bool written_this_epoch;  // true if written in this epoch
     _Atomic uint32_t txid;            // transaction ID of the writer (0 if none)
 } ctrl;
+
+typedef struct
+{
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+
+    uint32_t counter;   // current epoch
+    uint32_t remaining; // number of active transactions
+    uint32_t waiting;   // threads waiting
+} batcher;
 
 typedef struct segment_node
 {
@@ -116,9 +127,11 @@ typedef struct
     uint32_t epoch;
     uint32_t id;
 
+    // segmentos para libertar no fim da epoch
+    uint8_t *free_map;
     uint16_t *segments_to_free;
     size_t segments_to_free_count;
-    // size_t segments_to_free_capacity;
+    size_t segments_to_free_capacity;
 } txrecord;
 
 typedef struct
@@ -273,25 +286,41 @@ static bool address_to_segment_and_index(region *r, const void *address, segment
     return true;
 }
 
+static bool bit_test_and_set(uint8_t *bitmap, uint16_t index)
+{
+    uint8_t *byte = &bitmap[index >> 3];
+    uint8_t mask = (uint8_t)(1u << (index & 7));
+    bool was = (*byte & mask) != 0;
+    *byte = (uint8_t)(*byte | mask);
+    return was;
+}
+
 static bool push_segment_to_free(txrecord *t, uint16_t segment_id)
 {
     if (!t) // TODO: acho que isto é sempre falso mas yh
         return false;
+    // TODO: se ja estava marcado por outra transacao, aborta ou aceita ?
+    if (bit_test_and_set(t->free_map, segment_id))
+        return true;
+
+    // se ja estiver cheio, temos que duplicar cap
+    if (t->segments_to_free_count == t->segments_to_free_capacity)
+    {
+        size_t new_cap = t->segments_to_free_capacity * 2;
+        void *new_array = realloc(t->segments_to_free, new_cap * sizeof(uint16_t));
+        if (!new_array)
+            return false;
+        t->segments_to_free = new_array;
+        t->segments_to_free_capacity = new_cap;
+    }
     t->segments_to_free[t->segments_to_free_count++] = segment_id;
     return true;
 }
 
-// #############################################################
-// | TODO: review |
-// v              v
-// #############################################################
-
-void free_segment_node(segment_node *sn)
+static inline bool test_bits(const uint8_t *bitmap, uint16_t index)
 {
-    free(sn->control);
-    free(sn->copyA);
-    free(sn->copyB);
-    free(sn);
+    // true if bit at index "index" is 1
+    return (bitmap[index >> 3] >> (index & 7)) & 1u;
 }
 
 void epoch_boundary(void *ctx)
@@ -352,6 +381,88 @@ void epoch_boundary(void *ctx)
     }
 }
 
+// -----------------------------------------------------------------------------
+uint32_t get_epoch(batcher *bat)
+{
+    // can only be called by a thread after it entered the batcher, and before it left
+    pthread_mutex_lock(&bat->lock);
+    uint32_t epoch = bat->counter;
+    pthread_mutex_unlock(&bat->lock);
+    return epoch;
+}
+
+void enter_batcher(batcher *bat)
+{
+    pthread_mutex_lock(&bat->lock);
+    if (bat->remaining == 0)
+    {
+        bat->remaining = 1;
+        pthread_mutex_unlock(&bat->lock);
+        return;
+    }
+
+    // didnt work, wait for next batch
+    bat->waiting++;
+    uint32_t my_epoch = bat->counter;
+    do
+    {
+        pthread_cond_wait(&bat->cond, &bat->lock);
+    } while (my_epoch == bat->counter);
+    pthread_mutex_unlock(&bat->lock);
+}
+
+void leave_batcher(batcher *bat)
+{
+    pthread_mutex_lock(&bat->lock);
+    bat->remaining--;
+    if (bat->remaining == 0)
+    {
+        bat->counter++;
+        bat->remaining = bat->waiting;
+        bat->waiting = 0;
+        pthread_cond_broadcast(&bat->cond);
+    }
+    pthread_mutex_unlock(&bat->lock);
+}
+
+bool leave_batcher2(batcher *bat, void *region)
+{
+    pthread_mutex_lock(&bat->lock);
+
+    bat->remaining--;
+    if (bat->remaining > 0)
+    {
+        pthread_mutex_unlock(&bat->lock);
+        return false;
+    }
+
+    // im the last
+    bat->counter++;
+    bat->remaining = bat->waiting;
+    bat->waiting = 0;
+
+    if (region)
+        epoch_boundary(region);
+
+    pthread_cond_broadcast(&bat->cond);
+    pthread_mutex_unlock(&bat->lock);
+    return true;
+}
+
+void batcher_init(batcher *bat)
+{
+    pthread_mutex_init(&bat->lock, NULL);
+    pthread_cond_init(&bat->cond, NULL);
+    bat->counter = 0;
+    bat->remaining = 0;
+    bat->waiting = 0;
+}
+
+void batcher_destroy(batcher *bat)
+{
+    pthread_mutex_destroy(&bat->lock);
+    pthread_cond_destroy(&bat->cond);
+}
 // -----------------------------------------------------------------------------
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -524,8 +635,17 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
 
     t->is_ro = is_ro;
     t->aborted = false;
-    t->segments_to_free = NULL;
+    t->segments_to_free_capacity = 16; // TODO: maybe bigger ?
     t->segments_to_free_count = 0;
+    t->segments_to_free = malloc(t->segments_to_free_capacity * sizeof(uint16_t));
+    t->free_map = calloc(BITSET_BYTES, 1);
+    if (!t->segments_to_free || !t->free_map)
+    {
+        free(t->segments_to_free);
+        free(t->free_map);
+        free(t);
+        return invalid_tx;
+    }
 
     enter_batcher(&r->batcher);
     t->epoch = get_epoch(&r->batcher);
@@ -555,7 +675,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
             if (!s)
                 continue;
 
-            r->segment_table[segment_id] = NULL;
+            // r->segment_table[segment_id] = NULL;
 
             s->prev = NULL;
             s->next = r->pending_free;
@@ -568,6 +688,8 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx))
 
     // leave_batcher(&r->batcher);
     leave_batcher2(&r->batcher, r);
+    free(t->segments_to_free);
+    free(t->free_map);
     free(t);
     return committed;
 }
