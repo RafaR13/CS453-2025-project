@@ -99,8 +99,6 @@ typedef struct region
     size_t wl_capacity;          // capacidade do array
     write_list_item *write_list; // array of word indices that were written in this epoch
 
-    segment_node base; // base segment (non-freeable)
-
     segment_list allocs; // list of dynamically allocated segments
     segment_list pending_free;
 
@@ -108,7 +106,6 @@ typedef struct region
     segment_node **segment_table;
     uint32_t segment_count;
 
-    void *start;  // start of the shared memory region
     size_t align; // size of a word
     size_t size;  // size of the base segment
 } region;
@@ -480,10 +477,15 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
     region->segment_count = 0; // base segment is segment 0
-    region->segment_table[0] = &region->base;
 
     // initialize base segment
-    segment_node *base = &region->base;
+    segment_node *base = (segment_node *)malloc(sizeof(segment_node));
+    if (!base)
+    {
+        free(region->segment_table);
+        free(region);
+        return invalid_shared;
+    }
     base->id = 0;
     base->align = align;
     base->size = size;
@@ -492,6 +494,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     // allocate the 2 copies and control struct
     if (posix_memalign((void **)&(base->copyA), align, size) != 0)
     {
+        free(base);
         free(region->segment_table);
         free(region);
         return invalid_shared;
@@ -499,6 +502,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     if (posix_memalign((void **)&(base->copyB), align, size) != 0)
     {
         free(base->copyA);
+        free(base);
         free(region->segment_table);
         free(region);
         return invalid_shared;
@@ -507,6 +511,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     {
         free(base->copyA);
         free(base->copyB);
+        free(base);
         free(region->segment_table);
         free(region);
         return invalid_shared;
@@ -523,6 +528,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         atomic_init(&base->control[i].txid, 0);
     }
 
+    region->segment_table[0] = base;
+
     // initialize write list
     region->wl_capacity = base->words; // TODO: check
     region->write_list = (write_list_item *)malloc(region->wl_capacity * sizeof(*region->write_list));
@@ -531,6 +538,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         free(base->control);
         free(base->copyA);
         free(base->copyB);
+        free(base);
         free(region->segment_table);
         free(region);
         return invalid_shared;
@@ -539,7 +547,6 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
 
     // initialize batcher
     batcher_init(&region->batcher);
-    region->start = (void *)base->copyA;
     region->allocs = NULL;
     region->pending_free = NULL;
 
@@ -566,10 +573,6 @@ void tm_destroy(shared_t unused(shared))
     free(region->write_list);
     // batcher
     batcher_destroy(&region->batcher);
-    // base segment
-    free(region->base.control);
-    free(region->base.copyA);
-    free(region->base.copyB);
     // segment table
     free(region->segment_table);
     // region
