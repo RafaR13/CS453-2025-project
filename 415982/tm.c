@@ -411,20 +411,6 @@ void enter_batcher(batcher *bat)
     pthread_mutex_unlock(&bat->lock);
 }
 
-void leave_batcher(batcher *bat)
-{
-    pthread_mutex_lock(&bat->lock);
-    bat->remaining--;
-    if (bat->remaining == 0)
-    {
-        bat->counter++;
-        bat->remaining = bat->waiting;
-        bat->waiting = 0;
-        pthread_cond_broadcast(&bat->cond);
-    }
-    pthread_mutex_unlock(&bat->lock);
-}
-
 bool leave_batcher2(batcher *bat, void *region)
 {
     pthread_mutex_lock(&bat->lock);
@@ -916,13 +902,4 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
         return false;
 
     return push_segment_to_free(t, segment_id);
-}
-
-bool commit()
-{
-    // for each written word index:
-    //      defer the swap, of which copy for word index is the “valid”
-    //      copy, just after the last transaction from the current epoch
-    //      leaves the Batcher and before the next batch starts running;
-    return true;
 }
