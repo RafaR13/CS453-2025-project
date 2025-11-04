@@ -83,25 +83,22 @@ typedef struct segment_node
     // control
     ctrl *control;
 
+    // writes
+    struct segment_node *next_write;
+    _Atomic bool written_in_epoch;
+    uint8_t *write_bitmap;
+
 } segment_node;
 
 typedef struct segment_node *segment_list;
-
-typedef struct
-{
-    uint16_t segment_id;
-    size_t word_index;
-} write_list_item;
 
 typedef struct region
 {
     // batcher stuff
     batcher batcher;
 
-    // write list stuff (global por agora -- so para o segmento base)
-    _Atomic size_t wl_size;      // nº de entradas validas
-    size_t wl_capacity;          // capacidade do array
-    write_list_item *write_list; // array of word indices that were written in this epoch
+    // write list
+    segment_node *written;
 
     segment_list allocs;       // list of dynamically allocated segments
     segment_list pending_free; // list of pending frees
@@ -154,15 +151,28 @@ static inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readab
     return readable_copy ? (seg->copyA + index * seg->align) : (seg->copyB + index * seg->align);
 }
 
-static void wl_append(region *reg, uint16_t segment_id, size_t word_index)
+static inline void clear_bitmap_writes(uint8_t *bitmap, size_t bytes)
 {
-    size_t position = atomic_fetch_add_explicit(&reg->wl_size, 1, memory_order_acq_rel);
-    if (position < reg->wl_capacity)
-    {
-        reg->write_list[position].segment_id = segment_id;
-        reg->write_list[position].word_index = word_index;
-    }
-    // TODO: a write list pode dar overflow ?
+    memset(bitmap, 0, bytes);
+}
+static inline void bits_set(uint8_t *bits, size_t idx)
+{
+    bits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+}
+
+static void add_written_segment(region *r, segment_node *sn)
+{
+    if (!sn)
+        return;
+
+    uint8_t already_written = atomic_exchange_explicit(&sn->written_in_epoch, true, memory_order_acq_rel);
+    if (already_written)
+        return;
+
+    pthread_mutex_lock(&r->batcher.lock);
+    sn->next_write = r->written;
+    r->written = sn;
+    pthread_mutex_unlock(&r->batcher.lock);
 }
 
 static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
@@ -173,6 +183,7 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
         // read the readable copy into target
         bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
         memcpy(target, readable_ptr(segment, word_index, readable), r->align);
+        atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
         return true;
     }
 
@@ -189,15 +200,6 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
         memcpy(target, writable_ptr(segment, word_index, readable), r->align);
         return true;
     }
-
-    /*if (owner != t->id) {
-        uint32_t expected = 0;
-        if (!atomic_compare_exchange_strong_explicit(&c->txid, &expected, t->id,
-                                                     memory_order_acq_rel, memory_order_acquire)) {
-            // Another tx has already claimed this word (reader/writer) → abort
-            if (expected != t->id) return false;
-        }
-    }*/
 
     // add the transaction to the "access set" if not there already
     atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
@@ -245,7 +247,8 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
 
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(writable_ptr(segment, word_index, readable), source, r->align);
-    wl_append(r, segment->id, word_index);
+    bits_set(segment->write_bitmap, word_index);
+    add_written_segment(r, segment);
     return true;
 }
 
@@ -288,22 +291,43 @@ void epoch_boundary(void *ctx)
 {
     region *r = (region *)ctx;
 
-    // 1) Publicar writes deste epoch
-    size_t n = atomic_exchange_explicit(&r->wl_size, 0, memory_order_acq_rel);
-    for (size_t i = 0; i < n && i < r->wl_capacity; ++i)
+    // 1) Writes
+    segment_node *whead;
+    pthread_mutex_lock(&r->batcher.lock);
+    whead = r->written;
+    r->written = NULL;
+    pthread_mutex_unlock(&r->batcher.lock);
+
+    while (whead)
     {
-        uint16_t segid = r->write_list[i].segment_id;
-        size_t idx = r->write_list[i].word_index;
+        segment_node *seg = whead;
+        whead = whead->next_write;
+        seg->next_write = NULL;
+        atomic_store_explicit(&seg->written_in_epoch, false, memory_order_relaxed);
 
-        // pode já não estar na segment_table (se foi deregistered no commit)
-        segment_node *seg = r->segment_table[segid];
-
-        ctrl *c = &seg->control[idx];
-        bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
-        atomic_store_explicit(&c->readable_copy, !rc, memory_order_release);
-        atomic_store_explicit(&c->written_this_epoch, false, memory_order_release);
-        atomic_store_explicit(&c->has_read_or_written, false, memory_order_release);
-        atomic_store_explicit(&c->txid, 0, memory_order_release);
+        // percorre bits a 1 do dirty_bits: só essas palavras foram escritas
+        size_t nbytes = (seg->words + 7) / 8;
+        for (size_t byte = 0; byte < nbytes; ++byte)
+        {
+            uint8_t b = seg->write_bitmap[byte];
+            while (b)
+            {
+                unsigned bit = (unsigned)__builtin_ctz(b);
+                size_t idx = (byte << 3) + bit;
+                if (idx < seg->words)
+                {
+                    ctrl *c = &seg->control[idx];
+                    bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
+                    atomic_store_explicit(&c->readable_copy, !rc, memory_order_relaxed);
+                    atomic_store_explicit(&c->written_this_epoch, false, memory_order_relaxed);
+                    atomic_store_explicit(&c->has_read_or_written, false, memory_order_relaxed);
+                    atomic_store_explicit(&c->txid, 0, memory_order_relaxed);
+                }
+                b &= (uint8_t)(b - 1);
+            }
+        }
+        // limpa bitmap para próximo epoch
+        clear_bitmap_writes(seg->write_bitmap, nbytes);
     }
 
     // 2) libertar segments
@@ -523,10 +547,11 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     base->next_free = NULL;
     atomic_init(&base->pending_free, false);
 
-    // initialize write list
-    region->wl_capacity = base->words; // TODO: check
-    region->write_list = (write_list_item *)malloc(region->wl_capacity * sizeof(*region->write_list));
-    if (!region->write_list)
+    base->next_write = NULL;
+    atomic_init(&base->written_in_epoch, false);
+    size_t bitmap_bytes = (base->words + 7u) / 8u;
+    base->write_bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
+    if (!base->write_bitmap)
     {
         free(base->control);
         free(base->copyA);
@@ -536,7 +561,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         free(region);
         return invalid_shared;
     }
-    atomic_init(&region->wl_size, 0);
+
+    region->written = NULL;
 
     // initialize batcher
     batcher_init(&region->batcher);
@@ -549,7 +575,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
 /** Destroy (i.e. clean-up + free) a given shared memory region.
  * @param shared Shared memory region to destroy, with no running transaction
  **/
-void tm_destroy(shared_t unused(shared))
+void tm_destroy(shared_t shared)
 {
     struct region *region = (struct region *)shared;
     // free all segments
@@ -559,11 +585,10 @@ void tm_destroy(shared_t unused(shared))
         free(region->allocs->control);
         free(region->allocs->copyA);
         free(region->allocs->copyB);
+        free(region->allocs->write_bitmap);
         free(region->allocs);
         region->allocs = next;
     }
-    // write list
-    free(region->write_list);
     // batcher
     batcher_destroy(&region->batcher);
     // segment table
@@ -586,7 +611,7 @@ void *tm_start(shared_t unused(shared))
  * @param shared Shared memory region to query
  * @return First allocated segment size
  **/
-size_t tm_size(shared_t unused(shared))
+size_t tm_size(shared_t shared)
 {
     return ((struct region *)shared)->size;
 }
@@ -595,7 +620,7 @@ size_t tm_size(shared_t unused(shared))
  * @param shared Shared memory region to query
  * @return Alignment used globally
  **/
-size_t tm_align(shared_t unused(shared))
+size_t tm_align(shared_t shared)
 {
     return ((struct region *)shared)->align;
 }
@@ -605,7 +630,7 @@ size_t tm_align(shared_t unused(shared))
  * @param is_ro  Whether the transaction is read-only
  * @return Opaque transaction ID, 'invalid_tx' on failure
  **/
-tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
+tx_t tm_begin(shared_t shared, bool is_ro)
 {
     // TODO: what are failure conditions ?
 
@@ -769,7 +794,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
  * @param target Pointer in private memory receiving the address of the first byte of the newly allocated, aligned segment
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
  **/
-alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), void **unused(target))
+alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 {
     // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
 
@@ -781,10 +806,17 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
     // register the segment in the set of allocated segments;
 
     region *r = (region *)shared;
+    txrecord *t = get_transaction_record(tx);
     if (!r || !target)
+    {
+        t->aborted = true;
         return abort_alloc;
+    }
     if (size == 0 || (size % r->align) != 0)
+    {
+        t->aborted = true;
         return abort_alloc;
+    }
 
     size_t align = ((struct region *)shared)->align;
     size_t words = size / align;
@@ -842,6 +874,18 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
         atomic_init(&sn->control[i].txid, 0);
     }
 
+    // write bitmap
+    size_t bitmap_bytes = (words + 7u) / 8u;
+    sn->write_bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
+    if (!sn->write_bitmap)
+    {
+        free(sn->control);
+        free(sn->copyA);
+        free(sn->copyB);
+        free(sn);
+        return nomem_alloc;
+    }
+
     pthread_mutex_lock(&r->batcher.lock);
     sn->prev = NULL;
     sn->next = r->allocs;
@@ -851,6 +895,8 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
     sn->prev_free = NULL;
     sn->next_free = NULL;
     atomic_init(&sn->pending_free, false);
+    sn->next_write = NULL;
+    atomic_init(&sn->written_in_epoch, false);
     pthread_mutex_unlock(&r->batcher.lock);
 
     *target = encode_pointer(segment_id, 0);
@@ -864,7 +910,7 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
  * @param target Address of the first byte of the previously allocated segment to deallocate
  * @return Whether the whole transaction can continue
  **/
-bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
+bool tm_free(shared_t shared, tx_t tx, void *target)
 {
     // TODO: tm_free(shared_t, tx_t, void*)
 
