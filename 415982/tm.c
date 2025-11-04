@@ -64,9 +64,13 @@ typedef struct
 typedef struct segment_node
 {
     uint16_t id;
+    _Atomic bool pending_free;
 
     struct segment_node *next;
     struct segment_node *prev;
+
+    struct segment_node *prev_free;
+    struct segment_node *next_free;
 
     size_t size;  // size (bytes) of the segment
     size_t words; // bytes / align
@@ -99,12 +103,8 @@ typedef struct region
     size_t wl_capacity;          // capacidade do array
     write_list_item *write_list; // array of word indices that were written in this epoch
 
-    segment_list allocs; // list of dynamically allocated segments
-
-    // stuff to free segments
-    uint16_t retire_epoch[MAX_SEGMENTS];
-    _Atomic uint8_t pending_flags[MAX_SEGMENTS];   // 1 se alguma tx ja marcou para free
-    _Atomic uint8_t committed_flags[MAX_SEGMENTS]; // 1 se ja foi commited no epoch atual
+    segment_list allocs;       // list of dynamically allocated segments
+    segment_list pending_free; // list of pending frees
 
     // tabela de segments
     segment_node **segment_table;
@@ -137,12 +137,6 @@ typedef struct
     segment_node *seg;
     size_t word_index;
 } segment_and_index;
-
-typedef struct
-{
-    struct region *r;
-    uint32_t epoch;
-} commit;
 
 // -----------------------------------------------------------------------------
 
@@ -290,43 +284,6 @@ static bool address_to_segment_and_index(region *r, const void *address, segment
     return true;
 }
 
-/*static bool bit_test_and_set(uint8_t *bitmap, uint16_t index)
-{
-    uint8_t *byte = &bitmap[index >> 3];
-    uint8_t mask = (uint8_t)(1u << (index & 7));
-    bool was = (*byte & mask) != 0;
-    *byte = (uint8_t)(*byte | mask);
-    return was;
-}
-
-static bool push_segment_to_free(txrecord *t, uint16_t segment_id)
-{
-    if (!t) // TODO: acho que isto é sempre falso mas yh
-        return false;
-    // TODO: se ja estava marcado por outra transacao, aborta ou aceita ?
-    if (bit_test_and_set(t->free_map, segment_id))
-        return true;
-
-    // se ja estiver cheio, temos que duplicar cap
-    if (t->segments_to_free_count == t->segments_to_free_capacity)
-    {
-        size_t new_cap = t->segments_to_free_capacity * 2;
-        void *new_array = realloc(t->segments_to_free, new_cap * sizeof(uint16_t));
-        if (!new_array)
-            return false;
-        t->segments_to_free = new_array;
-        t->segments_to_free_capacity = new_cap;
-    }
-    t->segments_to_free[t->segments_to_free_count++] = segment_id;
-    return true;
-}
-
-static inline bool test_bits(const uint8_t *bitmap, uint16_t index)
-{
-    // true if bit at index "index" is 1
-    return (bitmap[index >> 3] >> (index & 7)) & 1u;
-}
-*/
 void epoch_boundary(void *ctx)
 {
     region *r = (region *)ctx;
@@ -340,20 +297,6 @@ void epoch_boundary(void *ctx)
 
         // pode já não estar na segment_table (se foi deregistered no commit)
         segment_node *seg = r->segment_table[segid];
-        if (!seg)
-        {
-            // tenta encontrá-lo na pending_free: ainda existe até aqui
-            /*for (segment_node *p = r->pending_free; p; p = p->next)
-            {
-                if (p->id == segid)
-                {
-                    seg = p;
-                    break;
-                }
-            }*/
-            if (!seg)
-                continue;
-        }
 
         ctrl *c = &seg->control[idx];
         bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -363,13 +306,23 @@ void epoch_boundary(void *ctx)
         atomic_store_explicit(&c->txid, 0, memory_order_release);
     }
 
-    // 2) Libertar segmentos pendentes (deregistered no commit)
-    /*segment_node *sn = r->pending_free;
+    // 2) libertar segments
+    segment_node *head;
+    pthread_mutex_lock(&r->batcher.lock);
+    head = r->pending_free;
     r->pending_free = NULL;
-    while (sn)
+    pthread_mutex_unlock(&r->batcher.lock);
+    while (head)
     {
-        segment_node *next = sn->next;
-        // remove de r->allocs (se manténs esta lista)
+        segment_node *sn = head;
+        head = head->next_free;
+
+        // corta encadeamento e (por segurança) limpa flag
+        sn->next_free = NULL;
+        // TODO: maybe unnecessary
+        atomic_store_explicit(&sn->pending_free, 0, memory_order_relaxed);
+
+        // remove de estruturas (allocs/segment_table) e libera memória
         if (sn->prev)
             sn->prev->next = sn->next;
         if (sn->next)
@@ -377,43 +330,14 @@ void epoch_boundary(void *ctx)
         if (r->allocs == sn)
             r->allocs = sn->next;
 
-        free(sn->control);
-        free(sn->copyA);
-        free(sn->copyB);
-        free(sn);
-        sn = next;
-    }*/
-
-    uint32_t ended_epoch = r->batcher.counter;
-    for (uint32_t segid = 1; segid < MAX_SEGMENTS; ++segid)
-    {
-        if (!atomic_load_explicit(&r->pending_flags[segid], memory_order_relaxed))
-            continue;
-        if (r->retire_epoch[segid] != ended_epoch)
-            continue;
-
-        if (atomic_load_explicit(&r->committed_flags[segid], memory_order_relaxed))
+        if (r->segment_table[sn->id])
         {
-            segment_node *sn = r->segment_table[segid];
-            if (sn)
-            {
-                if (sn->prev)
-                    sn->prev->next = sn->next;
-                if (sn->next)
-                    sn->next->prev = sn->prev;
-                if (r->allocs == sn)
-                    r->allocs = sn->next;
-
-                r->segment_table[segid] = NULL;
-                free(sn->control);
-                free(sn->copyA);
-                free(sn->copyB);
-                free(sn);
-            }
+            r->segment_table[sn->id] = NULL;
+            free(sn->control);
+            free(sn->copyA);
+            free(sn->copyB);
+            free(sn);
         }
-        atomic_store_explicit(&r->pending_flags[segid], 0, memory_order_relaxed);
-        atomic_store_explicit(&r->committed_flags[segid], 0, memory_order_relaxed);
-        r->retire_epoch[segid] = 0;
     }
 }
 
@@ -426,31 +350,20 @@ static inline void bitmap_set(uint64_t bitmap[MAX_SEGMENTS / 64], uint16_t segme
     bitmap[segment_index >> 6] |= (1ULL << (segment_index & 63));
 }
 
-typedef void (*bitmap_visit)(uint16_t segment, void *user);
-static inline void bm_for_each(const uint64_t bm[MAX_SEGMENTS / 64], bitmap_visit fn, void *user)
+static void add_pending_free(region *r, segment_node *sn)
 {
-    for (uint32_t w = 0; w < MAX_SEGMENTS / 64; ++w)
-    {
-        uint64_t x = bm[w];
-        while (x)
-        {
-            uint32_t b = __builtin_ctzll(x);
-            uint16_t seg = (uint16_t)((w << 6) + b);
-            fn(seg, user);
-            x &= (x - 1);
-        }
-    }
-}
+    if (!sn)
+        return;
 
-static inline void mark_committed_for_tx(uint16_t seg, void *user)
-{
-    commit *ctx = (commit *)user;
-    struct region *r = ctx->r;
-    if (atomic_load_explicit(&r->pending_flags[seg], memory_order_relaxed) &&
-        r->retire_epoch[seg] == ctx->epoch)
-    {
-        atomic_store_explicit(&r->committed_flags[seg], 1, memory_order_relaxed);
-    }
+    uint8_t already_pending = atomic_exchange_explicit(&sn->pending_free, true, memory_order_acq_rel);
+    if (already_pending)
+        return;
+
+    // TODO: será que dá para fazer lock free?
+    pthread_mutex_lock(&r->batcher.lock);
+    sn->next_free = r->pending_free;
+    r->pending_free = sn;
+    pthread_mutex_unlock(&r->batcher.lock);
 }
 
 // -----------------------------------------------------------------------------
@@ -604,6 +517,11 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     }
 
     region->segment_table[0] = base;
+    base->next = NULL;
+    base->prev = NULL;
+    base->prev_free = NULL;
+    base->next_free = NULL;
+    atomic_init(&base->pending_free, false);
 
     // initialize write list
     region->wl_capacity = base->words; // TODO: check
@@ -623,12 +541,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     // initialize batcher
     batcher_init(&region->batcher);
     region->allocs = NULL;
-    for (uint32_t i = 0; i < MAX_SEGMENTS; ++i)
-    {
-        region->retire_epoch[i] = 0;
-        atomic_init(&region->pending_flags[i], 0);
-        atomic_init(&region->committed_flags[i], 0);
-    }
+    region->pending_free = NULL;
 
     return region;
 }
@@ -704,17 +617,6 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
 
     t->is_ro = is_ro;
     t->aborted = false;
-    /*t->segments_to_free_capacity = 16; // TODO: maybe bigger ?
-    t->segments_to_free_count = 0;
-    t->segments_to_free = malloc(t->segments_to_free_capacity * sizeof(uint16_t));
-    t->free_map = calloc(BITSET_BYTES, 1);
-    if (!t->segments_to_free || !t->free_map)
-    {
-        free(t->segments_to_free);
-        free(t->free_map);
-        free(t);
-        return invalid_tx;
-    }*/
 
     clear_bitmap(t->free_map);
 
@@ -730,43 +632,31 @@ tx_t tm_begin(shared_t unused(shared), bool unused(is_ro))
  * @param tx     Transaction to end
  * @return Whether the whole transaction committed
  **/
-bool tm_end(shared_t unused(shared), tx_t unused(tx))
+bool tm_end(shared_t shared, tx_t tx)
 {
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     bool committed = !t->aborted;
 
-    /*if (committed && t->segments_to_free_count > 0)
-    {
-        pthread_mutex_lock(&r->batcher.lock);
-        for (size_t i = 0; i < t->segments_to_free_count; i++)
-        {
-            uint16_t segment_id = t->segments_to_free[i];
-            segment_node *s = r->segment_table[segment_id];
-            if (!s)
-                continue;
-
-            // r->segment_table[segment_id] = NULL;
-
-            s->prev = NULL;
-            s->next = r->pending_free;
-            if (s->next)
-                s->next->prev = s;
-            r->pending_free = s;
-        }
-        pthread_mutex_unlock(&r->batcher.lock);
-    }*/
-
     if (committed)
-    {
-        commit ctx = {.r = r, .epoch = t->epoch};
-        bm_for_each(t->free_map, mark_committed_for_tx, &ctx);
-    }
+        for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
+        {
+            uint64_t bm = t->free_map[i];
+            if (!bm)
+                continue;
+            const uint32_t base = i << 6;
+            while (bm)
+            {
+                unsigned b = (unsigned)__builtin_ctzll(bm);
+                uint16_t seg = (uint16_t)(base + b);
+                segment_node *sn = r->segment_table[seg];
+                if (sn)
+                    add_pending_free(r, sn);
+                bm &= (bm - 1);
+            }
+        }
 
-    // leave_batcher(&r->batcher);
     leave_batcher2(&r->batcher, r);
-    // free(t->segments_to_free);
-    // free(t->free_map);
     free(t);
     return committed;
 }
@@ -958,6 +848,9 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
     if (sn->next)
         sn->next->prev = sn;
     r->allocs = sn;
+    sn->prev_free = NULL;
+    sn->next_free = NULL;
+    atomic_init(&sn->pending_free, false);
     pthread_mutex_unlock(&r->batcher.lock);
 
     *target = encode_pointer(segment_id, 0);
@@ -992,9 +885,6 @@ bool tm_free(shared_t unused(shared), tx_t unused(tx), void *unused(target))
     if (!s)
         return false;
 
-    // return push_segment_to_free(t, segment_id);
-    r->retire_epoch[segment_id] = t->epoch;
-    atomic_store_explicit(&r->pending_flags[segment_id], 1, memory_order_relaxed);
     bitmap_set(t->free_map, segment_id);
     return true;
 }
