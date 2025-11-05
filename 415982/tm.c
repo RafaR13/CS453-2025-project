@@ -96,6 +96,7 @@ typedef struct region
 {
     // batcher stuff
     batcher batcher;
+    pthread_mutex_t segments_lock;
 
     // write list
     segment_node *written;
@@ -274,6 +275,8 @@ static bool address_to_segment_and_index(region *r, const void *address, segment
     if (!r || !address || !out)
         return false;
     uint16_t segment_id = get_segment_id_from_pointer(address);
+    if (segment_id >= MAX_SEGMENTS)
+        return false;
     uint64_t word_index = get_word_index_from_pointer(address);
 
     segment_node *segment = r->segment_table[segment_id];
@@ -293,10 +296,8 @@ void epoch_boundary(void *ctx)
 
     // 1) Writes
     segment_node *whead;
-    // pthread_mutex_lock(&r->batcher.lock);
     whead = r->written;
     r->written = NULL;
-    // pthread_mutex_unlock(&r->batcher.lock);
 
     while (whead)
     {
@@ -332,9 +333,7 @@ void epoch_boundary(void *ctx)
 
     // 2) libertar segments
     segment_node *head = r->pending_free;
-    // pthread_mutex_lock(&r->batcher.lock);
     r->pending_free = NULL;
-    // pthread_mutex_unlock(&r->batcher.lock);
     while (head)
     {
         segment_node *sn = head;
@@ -359,6 +358,7 @@ void epoch_boundary(void *ctx)
             free(sn->control);
             free(sn->copyA);
             free(sn->copyB);
+            free(sn->write_bitmap);
             free(sn);
         }
     }
@@ -417,8 +417,8 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     }
 
     // control
-    size_t ctrl = sizeof(void *);
-    if (posix_memalign((void **)&sn->control, ctrl, sizeof(ctrl) * words) != 0)
+    size_t ctrl_align = sizeof(void *);
+    if (posix_memalign((void **)&sn->control, ctrl_align, sizeof(*sn->control) * words) != 0)
     {
         free(sn->copyA);
         free(sn->copyB);
@@ -570,7 +570,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
 
     // initialize batcher
     batcher_init(&region->batcher);
-    region->allocs = NULL;
+    pthread_mutex_init(&region->segments_lock, NULL);
+    region->allocs = base;
     region->pending_free = NULL;
 
     return region;
@@ -595,6 +596,8 @@ void tm_destroy(shared_t shared)
     }
     // batcher
     batcher_destroy(&region->batcher);
+    // segments_lock
+    pthread_mutex_destroy(&region->segments_lock);
     // segment table
     free(region->segment_table);
     // region
@@ -822,13 +825,20 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
         return abort_alloc;
     }
 
+    pthread_mutex_lock(&r->segments_lock);
     if (r->segment_count + 1 >= MAX_SEGMENTS)
+    {
+        pthread_mutex_unlock(&r->segments_lock);
         return nomem_alloc;
+    }
     uint16_t segment_id = ++r->segment_count;
+    pthread_mutex_unlock(&r->segments_lock);
     segment_node *sn = allocate_segment(r, segment_id, size);
     if (!sn)
         return nomem_alloc;
+    pthread_mutex_lock(&r->segments_lock);
     r->segment_table[segment_id] = sn;
+    pthread_mutex_unlock(&r->segments_lock);
 
     pthread_mutex_lock(&r->batcher.lock);
     sn->prev = NULL;
