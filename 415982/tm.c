@@ -293,10 +293,10 @@ void epoch_boundary(void *ctx)
 
     // 1) Writes
     segment_node *whead;
-    pthread_mutex_lock(&r->batcher.lock);
+    // pthread_mutex_lock(&r->batcher.lock);
     whead = r->written;
     r->written = NULL;
-    pthread_mutex_unlock(&r->batcher.lock);
+    // pthread_mutex_unlock(&r->batcher.lock);
 
     while (whead)
     {
@@ -331,11 +331,10 @@ void epoch_boundary(void *ctx)
     }
 
     // 2) libertar segments
-    segment_node *head;
-    pthread_mutex_lock(&r->batcher.lock);
-    head = r->pending_free;
+    segment_node *head = r->pending_free;
+    // pthread_mutex_lock(&r->batcher.lock);
     r->pending_free = NULL;
-    pthread_mutex_unlock(&r->batcher.lock);
+    // pthread_mutex_unlock(&r->batcher.lock);
     while (head)
     {
         segment_node *sn = head;
@@ -376,7 +375,7 @@ static inline void bitmap_set(uint64_t bitmap[MAX_SEGMENTS / 64], uint16_t segme
 
 static void add_pending_free(region *r, segment_node *sn)
 {
-    if (!sn)
+    if (!sn || sn->id == 0 || r->segment_table[sn->id] == NULL)
         return;
 
     uint8_t already_pending = atomic_exchange_explicit(&sn->pending_free, true, memory_order_acq_rel);
@@ -388,6 +387,74 @@ static void add_pending_free(region *r, segment_node *sn)
     sn->next_free = r->pending_free;
     r->pending_free = sn;
     pthread_mutex_unlock(&r->batcher.lock);
+}
+
+static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
+{
+    size_t align = r->align;
+    size_t words = size / align;
+
+    segment_node *sn = (segment_node *)malloc(sizeof(segment_node));
+    if (unlikely(!sn))
+        return NULL;
+    sn->size = size;
+    sn->words = words;
+    sn->align = align;
+    sn->id = id;
+
+    // copies
+    size_t data = align < sizeof(void *) ? sizeof(void *) : align;
+    if (posix_memalign((void **)&sn->copyA, data, size) != 0)
+    {
+        free(sn);
+        return NULL;
+    }
+    if (posix_memalign((void **)&sn->copyB, data, size) != 0)
+    {
+        free(sn->copyA);
+        free(sn);
+        return NULL;
+    }
+
+    // control
+    size_t ctrl = sizeof(void *);
+    if (posix_memalign((void **)&sn->control, ctrl, sizeof(ctrl) * words) != 0)
+    {
+        free(sn->copyA);
+        free(sn->copyB);
+        free(sn);
+        return NULL;
+    }
+
+    // zero data
+    memset(sn->copyA, 0, size);
+    memset(sn->copyB, 0, size);
+    for (size_t i = 0; i < words; i++)
+    {
+        atomic_init(&sn->control[i].readable_copy, false);
+        atomic_init(&sn->control[i].has_read_or_written, false);
+        atomic_init(&sn->control[i].written_this_epoch, false);
+        atomic_init(&sn->control[i].txid, 0);
+    }
+
+    // bitmap
+    size_t bitmap_bytes = (words + 7u) / 8u;
+    sn->write_bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
+    if (!sn->write_bitmap)
+    {
+        free(sn->control);
+        free(sn->copyA);
+        free(sn->copyB);
+        free(sn);
+        return NULL;
+    }
+
+    sn->next = NULL;
+    sn->prev_free = sn->next_free = NULL;
+    atomic_init(&sn->pending_free, false);
+    sn->next_write = NULL;
+    atomic_init(&sn->written_in_epoch, false);
+    return sn;
 }
 
 // -----------------------------------------------------------------------------
@@ -490,78 +557,15 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     }
     region->segment_count = 0; // base segment is segment 0
 
-    // initialize base segment
-    segment_node *base = (segment_node *)malloc(sizeof(segment_node));
+    // base segment
+    segment_node *base = allocate_segment(region, 0, size);
     if (!base)
     {
         free(region->segment_table);
         free(region);
         return invalid_shared;
     }
-    base->id = 0;
-    base->align = align;
-    base->size = size;
-    base->words = size / align;
-
-    // allocate the 2 copies and control struct
-    if (posix_memalign((void **)&(base->copyA), align, size) != 0)
-    {
-        free(base);
-        free(region->segment_table);
-        free(region);
-        return invalid_shared;
-    }
-    if (posix_memalign((void **)&(base->copyB), align, size) != 0)
-    {
-        free(base->copyA);
-        free(base);
-        free(region->segment_table);
-        free(region);
-        return invalid_shared;
-    }
-    if (posix_memalign((void **)&(base->control), sizeof(void *), sizeof(ctrl) * base->words) != 0)
-    {
-        free(base->copyA);
-        free(base->copyB);
-        free(base);
-        free(region->segment_table);
-        free(region);
-        return invalid_shared;
-    }
-
-    // initialize the data with 0s and initialize the control struct
-    memset(base->copyA, 0, base->words * align);
-    memset(base->copyB, 0, base->words * align);
-    for (size_t i = 0; i < base->words; i++)
-    {
-        atomic_init(&base->control[i].readable_copy, false);
-        atomic_init(&base->control[i].has_read_or_written, false);
-        atomic_init(&base->control[i].written_this_epoch, false);
-        atomic_init(&base->control[i].txid, 0);
-    }
-
     region->segment_table[0] = base;
-    base->next = NULL;
-    base->prev = NULL;
-    base->prev_free = NULL;
-    base->next_free = NULL;
-    atomic_init(&base->pending_free, false);
-
-    base->next_write = NULL;
-    atomic_init(&base->written_in_epoch, false);
-    size_t bitmap_bytes = (base->words + 7u) / 8u;
-    base->write_bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
-    if (!base->write_bitmap)
-    {
-        free(base->control);
-        free(base->copyA);
-        free(base->copyB);
-        free(base);
-        free(region->segment_table);
-        free(region);
-        return invalid_shared;
-    }
-
     region->written = NULL;
 
     // initialize batcher
@@ -818,73 +822,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
         return abort_alloc;
     }
 
-    size_t align = ((struct region *)shared)->align;
-    size_t words = size / align;
-
-    // data segment
-    struct segment_node *sn = (struct segment_node *)malloc(sizeof(struct segment_node));
-    if (unlikely(!sn))
-        return nomem_alloc;
-    sn->size = size;
-    sn->words = words;
-    sn->align = align;
-
     if (r->segment_count + 1 >= MAX_SEGMENTS)
-    {
-        free(sn);
-        return nomem_alloc; // sem IDs livres
-    }
+        return nomem_alloc;
     uint16_t segment_id = ++r->segment_count;
+    segment_node *sn = allocate_segment(r, segment_id, size);
+    if (!sn)
+        return nomem_alloc;
     r->segment_table[segment_id] = sn;
-    sn->id = segment_id;
-
-    // copies
-    size_t data = align < sizeof(void *) ? sizeof(void *) : align; // sizeof(segment) or void*
-    if (posix_memalign((void **)&sn->copyA, data, size) != 0)
-    {
-        free(sn);
-        return nomem_alloc;
-    }
-    if (posix_memalign((void **)&sn->copyB, data, size) != 0)
-    {
-
-        free(sn->copyA);
-        free(sn);
-        return nomem_alloc;
-    }
-
-    // control
-    size_t ctrl = sizeof(void *);
-    if (posix_memalign((void **)&sn->control, ctrl, sizeof(ctrl) * words) != 0)
-    {
-        free(sn->copyA);
-        free(sn->copyB);
-        free(sn);
-        return nomem_alloc;
-    }
-
-    // zero the data
-    memset(sn->copyA, 0, size);
-    memset(sn->copyB, 0, size);
-    for (size_t i = 0; i < words; i++)
-    {
-        atomic_init(&sn->control[i].readable_copy, false);
-        atomic_init(&sn->control[i].has_read_or_written, false);
-        atomic_init(&sn->control[i].written_this_epoch, false);
-        atomic_init(&sn->control[i].txid, 0);
-    }
-
-    // write bitmap
-    size_t bitmap_bytes = (words + 7u) / 8u;
-    sn->write_bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
-    if (!sn->write_bitmap)
-    {
-        free(sn->control);
-        free(sn->copyA);
-        free(sn->copyB);
-        free(sn);
-        return nomem_alloc;
-    }
 
     pthread_mutex_lock(&r->batcher.lock);
     sn->prev = NULL;
@@ -892,11 +836,6 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     if (sn->next)
         sn->next->prev = sn;
     r->allocs = sn;
-    sn->prev_free = NULL;
-    sn->next_free = NULL;
-    atomic_init(&sn->pending_free, false);
-    sn->next_write = NULL;
-    atomic_init(&sn->written_in_epoch, false);
     pthread_mutex_unlock(&r->batcher.lock);
 
     *target = encode_pointer(segment_id, 0);
