@@ -64,7 +64,10 @@ typedef struct
 typedef struct segment_node
 {
     uint16_t id;
+
+    // frees
     _Atomic bool pending_free;
+    //_Atomic uint32_t freer_txid;
 
     struct segment_node *next;
     struct segment_node *prev;
@@ -97,6 +100,9 @@ typedef struct region
     // batcher stuff
     batcher batcher;
     pthread_mutex_t segments_lock;
+    pthread_mutex_t written_lock;
+    pthread_mutex_t free_lock;
+    _Atomic uint32_t transaction_id_counter;
 
     // write list
     segment_node *written;
@@ -170,21 +176,25 @@ static void add_written_segment(region *r, segment_node *sn)
     if (already_written)
         return;
 
-    pthread_mutex_lock(&r->batcher.lock);
+    pthread_mutex_lock(&r->written_lock);
     sn->next_write = r->written;
     r->written = sn;
-    pthread_mutex_unlock(&r->batcher.lock);
+    pthread_mutex_unlock(&r->written_lock);
 }
 
 static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
 {
     ctrl *c = &segment->control[word_index];
+    /*uint32_t pending_free_txid = atomic_load_explicit(&segment->freer_txid, memory_order_acquire);
+    if (pending_free_txid != 0 && pending_free_txid != t->id)
+        return false;*/
+
     if (t->is_ro)
     {
         // read the readable copy into target
         bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
         memcpy(target, readable_ptr(segment, word_index, readable), r->align);
-        atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
+        // atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
         return true;
     }
 
@@ -213,6 +223,9 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
 static bool write_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void const *source)
 {
     ctrl *c = &segment->control[word_index];
+    /*uint32_t pending_free_txid = atomic_load_explicit(&segment->freer_txid, memory_order_acquire);
+    if (pending_free_txid != 0 && pending_free_txid != t->id)
+        return false;*/
 
     bool written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
     if (written)
@@ -296,8 +309,10 @@ void epoch_boundary(void *ctx)
 
     // 1) Writes
     segment_node *whead;
+    pthread_mutex_lock(&r->written_lock);
     whead = r->written;
     r->written = NULL;
+    pthread_mutex_unlock(&r->written_lock);
 
     while (whead)
     {
@@ -383,10 +398,10 @@ static void add_pending_free(region *r, segment_node *sn)
         return;
 
     // TODO: será que dá para fazer lock free?
-    pthread_mutex_lock(&r->batcher.lock);
+    pthread_mutex_lock(&r->free_lock);
     sn->next_free = r->pending_free;
     r->pending_free = sn;
-    pthread_mutex_unlock(&r->batcher.lock);
+    pthread_mutex_unlock(&r->free_lock);
 }
 
 static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
@@ -454,6 +469,7 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     atomic_init(&sn->pending_free, false);
     sn->next_write = NULL;
     atomic_init(&sn->written_in_epoch, false);
+    // atomic_init(&sn->freer_txid, 0);
     return sn;
 }
 
@@ -525,6 +541,14 @@ void batcher_destroy(batcher *bat)
     pthread_mutex_destroy(&bat->lock);
     pthread_cond_destroy(&bat->cond);
 }
+
+static inline bool abort_tx(region *r, txrecord *t)
+{
+    t->aborted = true;
+    leave_batcher2(&r->batcher, r);
+    free(t);
+    return false;
+}
 // -----------------------------------------------------------------------------
 
 /** Create (i.e. allocate + init) a new shared memory region, with one first non-free-able allocated segment of the requested size and alignment.
@@ -556,6 +580,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
     region->segment_count = 0; // base segment is segment 0
+    atomic_init(&region->transaction_id_counter, 1);
 
     // base segment
     segment_node *base = allocate_segment(region, 0, size);
@@ -571,6 +596,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     // initialize batcher
     batcher_init(&region->batcher);
     pthread_mutex_init(&region->segments_lock, NULL);
+    pthread_mutex_init(&region->written_lock, NULL);
+    pthread_mutex_init(&region->free_lock, NULL);
     region->allocs = base;
     region->pending_free = NULL;
 
@@ -598,6 +625,8 @@ void tm_destroy(shared_t shared)
     batcher_destroy(&region->batcher);
     // segments_lock
     pthread_mutex_destroy(&region->segments_lock);
+    pthread_mutex_destroy(&region->written_lock);
+    pthread_mutex_destroy(&region->free_lock);
     // segment table
     free(region->segment_table);
     // region
@@ -654,7 +683,10 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 
     enter_batcher(&r->batcher);
     t->epoch = get_epoch(&r->batcher);
-    t->id = (uint32_t)((uintptr_t)t & 0x7ffffffff);
+    uint32_t id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
+    if (id == 0)
+        id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
+    t->id = id;
 
     return (tx_t)t;
 }
@@ -687,6 +719,10 @@ bool tm_end(shared_t shared, tx_t tx)
                 bm &= (bm - 1);
             }
         }
+    /*else
+    {
+        // se aplicar a cena de registar que o segmento esta a ser freed, tem que se resettar as variaveis aqui
+    }*/
 
     leave_batcher2(&r->batcher, r);
     free(t);
@@ -712,15 +748,17 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
     if (!r || size == 0 || (size % r->align) != 0)
     {
-        t->aborted = true;
-        return false;
+        // t->aborted = true;
+        // return false;
+        return abort_tx(r, t);
     }
 
     segment_and_index si;
     if (!address_to_segment_and_index(r, source, &si))
     {
-        t->aborted = true;
-        return false;
+        // t->aborted = true;
+        // return false;
+        return abort_tx(r, t);
     }
 
     size_t words = size / r->align;
@@ -732,13 +770,15 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
         if (si.word_index >= si.seg->words)
         {
-            t->aborted = true;
-            return false;
+            // t->aborted = true;
+            // return false;
+            return abort_tx(r, t);
         }
         if (!read_word(r, t, si.seg, si.word_index, out))
         {
-            t->aborted = true;
-            return false;
+            // t->aborted = true;
+            // return false;
+            return abort_tx(r, t);
         }
     }
     return true;
@@ -763,15 +803,17 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
     if (!r || size == 0 || (size % r->align) != 0)
     {
-        t->aborted = true;
-        return false;
+        // t->aborted = true;
+        // return false;
+        return abort_tx(r, t);
     }
 
     segment_and_index si;
     if (!address_to_segment_and_index(r, target, &si))
     {
-        t->aborted = true;
-        return false;
+        // t->aborted = true;
+        // return false;
+        return abort_tx(r, t);
     }
 
     size_t words = size / r->align;
@@ -782,13 +824,15 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     {
         if (si.word_index >= si.seg->words)
         {
-            t->aborted = true;
-            return false;
+            // t->aborted = true;
+            // return false;
+            return abort_tx(r, t);
         }
         if (!write_word(r, t, si.seg, si.word_index, in))
         {
-            t->aborted = true;
-            return false;
+            // t->aborted = true;
+            // return false;
+            return abort_tx(r, t);
         }
     }
     return true;
@@ -816,12 +860,15 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     txrecord *t = get_transaction_record(tx);
     if (!r || !target)
     {
-        t->aborted = true;
+        // t->aborted = true;
+
+        abort_tx(r, t);
         return abort_alloc;
     }
     if (size == 0 || (size % r->align) != 0)
     {
-        t->aborted = true;
+        // t->aborted = true;
+        abort_tx(r, t);
         return abort_alloc;
     }
 
@@ -840,13 +887,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     r->segment_table[segment_id] = sn;
     pthread_mutex_unlock(&r->segments_lock);
 
-    pthread_mutex_lock(&r->batcher.lock);
+    pthread_mutex_lock(&r->segments_lock);
     sn->prev = NULL;
     sn->next = r->allocs;
     if (sn->next)
         sn->next->prev = sn;
     r->allocs = sn;
-    pthread_mutex_unlock(&r->batcher.lock);
+    pthread_mutex_unlock(&r->segments_lock);
 
     *target = encode_pointer(segment_id, 0);
 
@@ -870,15 +917,23 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     if (!r || !target || !t)
-        return false;
+    {
+        // t->aborted = true;
+        // return false;
+        return abort_tx(r, t);
+    }
 
     uint16_t segment_id = get_segment_id_from_pointer(target);
-    if (segment_id == 0) // base
-        return false;
+    if (segment_id == 0)
+    { // base
+        return abort_tx(r, t);
+    }
 
     segment_node *s = r->segment_table[segment_id];
     if (!s)
-        return false;
+        return abort_tx(r, t);
+
+    // atomic_store_explicit(&s->freer_txid, t->id, memory_order_release);
 
     bitmap_set(t->free_map, segment_id);
     return true;
