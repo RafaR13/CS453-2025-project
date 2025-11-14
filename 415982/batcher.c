@@ -62,7 +62,7 @@ void batcher_init(batcher *bat)
 {
     pthread_mutex_init(&bat->lock, NULL);
     pthread_cond_init(&bat->cond, NULL);
-    bat->counter = 0;
+    bat->counter = 1;
     bat->remaining = 0;
     bat->waiting = 0;
 }

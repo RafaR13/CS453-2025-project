@@ -49,10 +49,10 @@ void epoch_boundary(void *ctx);
 
 typedef struct
 {
-    _Atomic bool readable_copy;       // 0 if A, 1 if B
-    _Atomic bool has_read_or_written; // basically the "access set"
-    _Atomic bool written_this_epoch;  // true if written in this epoch
-    _Atomic uint32_t txid;            // transaction ID of the writer (0 if none)
+    _Atomic bool readable_copy; // 0 if A, 1 if B
+    //_Atomic uint32_t has_read_or_written; // basically the "access set"
+    _Atomic uint32_t written_this_epoch; // true if written in this epoch
+    _Atomic uint64_t txid;               // transaction ID of the writer (0 if none)
 } ctrl;
 
 typedef struct segment_node
@@ -296,9 +296,9 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     for (size_t i = 0; i < words; i++)
     {
         atomic_init(&sn->control[i].readable_copy, false);
-        atomic_init(&sn->control[i].has_read_or_written, false);
-        atomic_init(&sn->control[i].written_this_epoch, false);
-        atomic_init(&sn->control[i].txid, 0);
+        // atomic_init(&sn->control[i].has_read_or_written, 0u);
+        atomic_init(&sn->control[i].written_this_epoch, 0u);
+        atomic_init(&sn->control[i].txid, 0ull);
     }
 
     // bitmap
@@ -321,6 +321,22 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     // atomic_init(&sn->freer_txid, 0);
     return sn;
 }
+
+static inline uint64_t make_owner(uint32_t epoch, uint32_t id)
+{
+    return ((uint64_t)epoch << 32) | (uint64_t)id;
+}
+
+static inline uint32_t owner_epoch(uint64_t owner)
+{
+    return (uint32_t)(owner >> 32);
+}
+
+static inline uint32_t owner_id(uint64_t owner)
+{
+    return (uint32_t)(owner & 0xffffffffu);
+}
+
 // -----------------------------------------------------------------------------
 
 // helpers mais importantes ----------------------------------------------------
@@ -328,9 +344,6 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
 static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
 {
     ctrl *c = &segment->control[word_index];
-    /*uint32_t pending_free_txid = atomic_load_explicit(&segment->freer_txid, memory_order_acquire);
-    if (pending_free_txid != 0 && pending_free_txid != t->id)
-        return false;*/
 
     if (t->is_ro)
     {
@@ -340,13 +353,19 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
         return true;
     }
 
-    bool written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+    uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
 
-    if (written /* the word has been written in the current epoch*/)
+    if (written == t->epoch /* the word has been written in the current epoch*/)
     {
-        uint32_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
-        bool has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
-        if (has_read_or_written && owner != t->id && owner != 0 /* this transaction is already in the "access set" */)
+        uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
+        uint32_t ownerEpoch = owner_epoch(owner);
+        uint32_t ownerId = owner_id(owner);
+        // uint32_t has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
+
+        // if transaction is in the access set, abort
+        // if (has_read_or_written == t->epoch && (ownerId != t->id || ownerEpoch != t->epoch))
+        //   return false;
+        if (!(ownerEpoch == t->epoch && ownerId == t->id))
             return false;
 
         // read the writable copy into target
@@ -355,9 +374,12 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
         return true;
     }
 
-    // add the transaction to the "access set" if not there already
-    atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
-    atomic_store_explicit(&c->txid, t->id, memory_order_release);
+    // im now the owner (if there wasnt one already in this epoch)
+    uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
+    uint32_t ownerEpoch = owner_epoch(owner);
+    uint32_t ownerId = owner_id(owner);
+    if (owner == 0 || ownerEpoch != t->epoch)
+        atomic_store_explicit(&c->txid, make_owner(t->epoch, t->id), memory_order_release);
     // read the readable copy into target
     bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(target, readable_ptr(segment, word_index, rc), r->align);
@@ -367,17 +389,15 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
 static bool write_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void const *source)
 {
     ctrl *c = &segment->control[word_index];
-    /*uint32_t pending_free_txid = atomic_load_explicit(&segment->freer_txid, memory_order_acquire);
-    if (pending_free_txid != 0 && pending_free_txid != t->id)
-        return false;*/
 
-    bool written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
-    if (written)
+    uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+    if (written == t->epoch)
     {
-        uint32_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
-        bool has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
+        uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
+        uint32_t ownerEpoch = owner_epoch(owner);
+        uint32_t ownerId = owner_id(owner);
 
-        if (owner != t->id)
+        if (!(ownerId == t->id && ownerEpoch == t->epoch))
             return false;
 
         bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -386,25 +406,20 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
     }
 
     // word hasnt been written this epoch yet
-    uint32_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
-    bool has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
-    if (has_read_or_written && owner != t->id)
+    // uint32_t has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
+    uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
+    uint32_t ownerEpoch = owner_epoch(owner);
+    uint32_t ownerId = owner_id(owner);
+
+    if (ownerEpoch == t->epoch && ownerId != t->id)
         return false;
 
-    if (owner == 0)
-    {
-        uint32_t expected = 0;
-        if (!atomic_compare_exchange_strong_explicit(&c->txid, &expected, t->id,
-                                                     memory_order_acq_rel, memory_order_acquire))
-        {
-            // some transaction has already claimed this word
-            if (expected != t->id)
-                return false;
-        }
-    }
+    // im the owner
+    uint64_t newOwner = make_owner(t->epoch, t->id);
 
-    atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
+    // atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
     atomic_store_explicit(&c->written_this_epoch, true, memory_order_release);
+    atomic_store_explicit(&c->txid, newOwner, memory_order_release);
 
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(writable_ptr(segment, word_index, readable), source, r->align);
@@ -429,7 +444,7 @@ void epoch_boundary(void *ctx)
         segment_node *seg = whead;
         whead = whead->next_write;
         seg->next_write = NULL;
-        atomic_store_explicit(&seg->written_in_epoch, false, memory_order_relaxed);
+        // atomic_store_explicit(&seg->written_in_epoch, false, memory_order_relaxed);
 
         // percorre bits a 1 do dirty_bits: só essas palavras foram escritas
         size_t nbytes = (seg->words + 7) / 8;
@@ -445,9 +460,9 @@ void epoch_boundary(void *ctx)
                     ctrl *c = &seg->control[idx];
                     bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
                     atomic_store_explicit(&c->readable_copy, !rc, memory_order_relaxed);
-                    atomic_store_explicit(&c->written_this_epoch, false, memory_order_relaxed);
-                    atomic_store_explicit(&c->has_read_or_written, false, memory_order_relaxed);
-                    atomic_store_explicit(&c->txid, 0, memory_order_relaxed);
+                    // atomic_store_explicit(&c->written_this_epoch, false, memory_order_relaxed);
+                    // atomic_store_explicit(&c->has_read_or_written, false, memory_order_relaxed);
+                    // atomic_store_explicit(&c->txid, 0, memory_order_relaxed);
                 }
                 b &= (uint8_t)(b - 1);
             }
