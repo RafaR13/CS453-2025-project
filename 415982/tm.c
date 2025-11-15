@@ -49,10 +49,9 @@ void epoch_boundary(void *ctx);
 
 typedef struct
 {
-    _Atomic bool readable_copy; // 0 if A, 1 if B
-    //_Atomic uint32_t has_read_or_written; // basically the "access set"
-    _Atomic uint32_t written_this_epoch; // true if written in this epoch
-    _Atomic uint64_t txid;               // transaction ID of the writer (0 if none)
+    _Atomic bool readable_copy;          // 0 if A, 1 if B
+    _Atomic uint32_t written_this_epoch; // if its equal to the current epoch, then someone has written this epoch
+    _Atomic uint64_t txid;               // 32 bits of epoch + 32 bits of transaction id
 } ctrl;
 
 typedef struct segment_node
@@ -61,7 +60,6 @@ typedef struct segment_node
 
     // frees
     _Atomic bool pending_free;
-    //_Atomic uint32_t freer_txid;
 
     struct segment_node *next;
     struct segment_node *prev;
@@ -239,7 +237,7 @@ static bool address_to_segment_and_index(region *r, const void *address, segment
 
 static void add_pending_free(region *r, segment_node *sn)
 {
-    if (!sn || sn->id == 0 || r->segment_table[sn->id] == NULL)
+    if (!sn || sn->id < 2 || r->segment_table[sn->id] == NULL)
         return;
 
     uint8_t already_pending = atomic_exchange_explicit(&sn->pending_free, true, memory_order_acq_rel);
@@ -296,7 +294,6 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     for (size_t i = 0; i < words; i++)
     {
         atomic_init(&sn->control[i].readable_copy, false);
-        // atomic_init(&sn->control[i].has_read_or_written, 0u);
         atomic_init(&sn->control[i].written_this_epoch, 0u);
         atomic_init(&sn->control[i].txid, 0ull);
     }
@@ -318,7 +315,6 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     atomic_init(&sn->pending_free, false);
     sn->next_write = NULL;
     atomic_init(&sn->written_in_epoch, false);
-    // atomic_init(&sn->freer_txid, 0);
     return sn;
 }
 
@@ -360,11 +356,8 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
         uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
         uint32_t ownerEpoch = owner_epoch(owner);
         uint32_t ownerId = owner_id(owner);
-        // uint32_t has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
 
         // if transaction is in the access set, abort
-        // if (has_read_or_written == t->epoch && (ownerId != t->id || ownerEpoch != t->epoch))
-        //   return false;
         if (!(ownerEpoch == t->epoch && ownerId == t->id))
             return false;
 
@@ -406,7 +399,6 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
     }
 
     // word hasnt been written this epoch yet
-    // uint32_t has_read_or_written = atomic_load_explicit(&c->has_read_or_written, memory_order_acquire);
     uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
     uint32_t ownerEpoch = owner_epoch(owner);
     uint32_t ownerId = owner_id(owner);
@@ -417,8 +409,7 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
     // im the owner
     uint64_t newOwner = make_owner(t->epoch, t->id);
 
-    // atomic_store_explicit(&c->has_read_or_written, true, memory_order_release);
-    atomic_store_explicit(&c->written_this_epoch, true, memory_order_release);
+    atomic_store_explicit(&c->written_this_epoch, t->epoch, memory_order_release);
     atomic_store_explicit(&c->txid, newOwner, memory_order_release);
 
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -444,7 +435,6 @@ void epoch_boundary(void *ctx)
         segment_node *seg = whead;
         whead = whead->next_write;
         seg->next_write = NULL;
-        // atomic_store_explicit(&seg->written_in_epoch, false, memory_order_relaxed);
 
         // percorre bits a 1 do dirty_bits: só essas palavras foram escritas
         size_t nbytes = (seg->words + 7) / 8;
@@ -460,9 +450,6 @@ void epoch_boundary(void *ctx)
                     ctrl *c = &seg->control[idx];
                     bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
                     atomic_store_explicit(&c->readable_copy, !rc, memory_order_relaxed);
-                    // atomic_store_explicit(&c->written_this_epoch, false, memory_order_relaxed);
-                    // atomic_store_explicit(&c->has_read_or_written, false, memory_order_relaxed);
-                    // atomic_store_explicit(&c->txid, 0, memory_order_relaxed);
                 }
                 b &= (uint8_t)(b - 1);
             }
@@ -549,7 +536,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         printf("failed to allocate segment table\n");
         return invalid_shared;
     }
-    region->segment_count = 1; // base segment is segment 0
+    region->segment_count = 1;
     atomic_init(&region->transaction_id_counter, 1);
 
     // base segment
@@ -765,11 +752,11 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         {
             // t->aborted = true;
             // return false;
-            printf("read_word failed in tm_read with transaction id %u\n", t->id);
+            // printf("read_word failed in tm_read with transaction id %u\n and epoch %u", t->id, t->epoch);
             return abort_tx(r, t);
         }
     }
-    // printf("tm_read succeeded (tx with id %u)\n", t->id);
+    // printf("tm_read succeeded (tx with id %u and epoch %u)\n", t->id, t->epoch);
     return true;
 }
 
@@ -825,7 +812,7 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         {
             // t->aborted = true;
             // return false;
-            printf("write_word failed in tm_write for transaction with id %u\n", t->id);
+            // printf("write_word failed in tm_write for transaction with id %u\n", t->id);
             return abort_tx(r, t);
         }
     }
@@ -856,14 +843,12 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     printf("called tm_alloc (tx with id %u)\n", t->id);
     if (!r || !target)
     {
-        // t->aborted = true;
         printf("invalid parameters in tm_alloc\n");
         abort_tx(r, t);
         return abort_alloc;
     }
     if (size == 0 || (size % r->align) != 0)
     {
-        // t->aborted = true;
         printf("invalid size in tm_alloc\n");
         abort_tx(r, t);
         return abort_alloc;
@@ -920,8 +905,6 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     printf("called tm_free (tx with id %u)\n", t->id);
     if (!r || !target || !t)
     {
-        // t->aborted = true;
-        // return false;
         printf("invalid parameters in tm_free\n");
         return abort_tx(r, t);
     }
@@ -940,7 +923,18 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
         return abort_tx(r, t);
     }
 
-    // atomic_store_explicit(&s->freer_txid, t->id, memory_order_release);
+    for (size_t i = 0; i < s->words; i++)
+    {
+        ctrl *c = &s->control[i];
+        uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
+        uint32_t ownerEpoch = owner_epoch(owner);
+        uint32_t ownerId = owner_id(owner);
+        if (owner != 0 && (ownerEpoch == t->epoch && ownerId != t->id))
+        {
+            printf("attempt to free segment in use by another transaction in tm_free\n");
+            return abort_tx(r, t);
+        }
+    }
 
     bitmap_set(t->free_map, segment_id);
     printf("tm_free succeeded (tx with id %u)\n", t->id);
