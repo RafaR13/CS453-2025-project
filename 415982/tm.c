@@ -117,7 +117,12 @@ enum
     FLAG_WRITTEN = 1 << 1,  // 1 if written in this epoch
     FLAG_LISTED = 1 << 2    // 1 if in the write list
 };
-
+typedef struct write_entry
+{
+    segment_node *seg;
+    size_t word_index;
+    struct write_entry *next;
+} write_entry;
 typedef struct
 {
     bool is_ro;
@@ -127,6 +132,7 @@ typedef struct
 
     // pending frees
     uint64_t free_map[MAX_SEGMENTS / 64];
+    write_entry *write_list;
 } txrecord;
 
 typedef struct
@@ -160,6 +166,11 @@ static inline void bits_set(uint8_t *bits, size_t idx)
     bits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
 }
 
+static inline void bits_clear(uint8_t *bits, size_t idx)
+{
+    bits[idx >> 3] &= (uint8_t)~(1u << (idx & 7));
+}
+
 static inline int is_power_of_2(size_t x) { return x && ((x & (x - 1)) == 0); }
 
 static inline void *encode_pointer(uint16_t segment_id, uint64_t byte_offset)
@@ -179,7 +190,24 @@ static inline void bitmap_set(uint64_t bitmap[MAX_SEGMENTS / 64], uint16_t segme
 
 static inline bool abort_tx(region *r, txrecord *t)
 {
+    if (!t)
+        return false;
     t->aborted = true;
+
+    // revert writes
+    write_entry *e = t->write_list;
+    while (e)
+    {
+        ctrl *c = &e->seg->control[e->word_index];
+        atomic_store_explicit(&c->written_this_epoch, 0u, memory_order_relaxed);
+        atomic_store_explicit(&c->txid, 0ull, memory_order_relaxed);
+        bits_clear(e->seg->write_bitmap, e->word_index);
+        write_entry *next = e->next;
+        free(e);
+        e = next;
+    }
+    t->write_list = NULL;
+
     leave_batcher(&r->batcher, r);
     free(t);
     return false;
@@ -370,7 +398,6 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
     // im now the owner (if there wasnt one already in this epoch)
     uint64_t owner = atomic_load_explicit(&c->txid, memory_order_acquire);
     uint32_t ownerEpoch = owner_epoch(owner);
-    uint32_t ownerId = owner_id(owner);
     if (owner == 0 || ownerEpoch != t->epoch)
         atomic_store_explicit(&c->txid, make_owner(t->epoch, t->id), memory_order_release);
     // read the readable copy into target
@@ -409,13 +436,22 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
     // im the owner
     uint64_t newOwner = make_owner(t->epoch, t->id);
 
+    write_entry *e = malloc(sizeof(write_entry));
+    if (!e)
+        return false;
+
     atomic_store_explicit(&c->written_this_epoch, t->epoch, memory_order_release);
     atomic_store_explicit(&c->txid, newOwner, memory_order_release);
 
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(writable_ptr(segment, word_index, readable), source, r->align);
-    bits_set(segment->write_bitmap, word_index);
-    add_written_segment(r, segment);
+    // bits_set(segment->write_bitmap, word_index);
+    // add_written_segment(r, segment);
+    e->seg = segment;
+    e->word_index = word_index;
+    e->next = t->write_list;
+    t->write_list = e;
+
     return true;
 }
 
@@ -456,6 +492,8 @@ void epoch_boundary(void *ctx)
         }
         // limpa bitmap para próximo epoch
         clear_bitmap_writes(seg->write_bitmap, nbytes);
+        // written_this_epoch tem que estar false
+        atomic_store_explicit(&seg->written_in_epoch, 0, memory_order_release);
     }
 
     // 2) libertar segments
@@ -647,6 +685,7 @@ tx_t tm_begin(shared_t shared, bool is_ro)
     t->aborted = false;
 
     clear_bitmap(t->free_map);
+    t->write_list = NULL;
 
     // printf("about to enter batcher\n");
     enter_batcher(&r->batcher);
@@ -673,6 +712,7 @@ bool tm_end(shared_t shared, tx_t tx)
     bool committed = !t->aborted;
 
     if (committed)
+    {
         for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
         {
             uint64_t bm = t->free_map[i];
@@ -689,10 +729,19 @@ bool tm_end(shared_t shared, tx_t tx)
                 bm &= (bm - 1);
             }
         }
-    /*else
-    {
-        // se aplicar a cena de registar que o segmento esta a ser freed, tem que se resettar as variaveis aqui
-    }*/
+        write_entry *e = t->write_list;
+        while (e)
+        {
+            // bits_set(segment->write_bitmap, word_index);
+            // add_written_segment(r, segment);
+            bits_set(e->seg->write_bitmap, e->word_index);
+            add_written_segment(r, e->seg);
+            write_entry *next = e->next;
+            free(e);
+            e = next;
+        }
+        t->write_list = NULL;
+    }
 
     leave_batcher(&r->batcher, r);
     free(t);
@@ -840,7 +889,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
-    printf("called tm_alloc (tx with id %u)\n", t->id);
+    // printf("called tm_alloc (tx with id %u)\n", t->id);
     if (!r || !target)
     {
         printf("invalid parameters in tm_alloc\n");
@@ -882,7 +931,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     pthread_mutex_unlock(&r->segments_lock);
 
     *target = encode_pointer(segment_id, 0);
-    printf("tm_alloc succeeded (tx with id %u), segment id %u\n", t->id, segment_id);
+    // printf("tm_alloc succeeded (tx with id %u), segment id %u\n", t->id, segment_id);
     return success_alloc;
 }
 
