@@ -165,7 +165,9 @@ static inline void clear_bitmap_writes(uint8_t *bitmap, size_t bytes)
 
 static inline void bits_set(uint8_t *bits, size_t idx)
 {
-    bits[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+    size_t byte = idx >> 3;
+    uint8_t mask = (uint8_t)(1u << (idx & 7));
+    atomic_fetch_or_explicit((_Atomic uint8_t *)&bits[byte], mask, memory_order_acq_rel);
 }
 
 static inline void bits_clear(uint8_t *bits, size_t idx)
@@ -203,8 +205,8 @@ static inline bool abort_tx(region *r, txrecord *t)
         ctrl *c = &e->seg->control[e->word_index];
         atomic_store_explicit(&c->written_this_epoch, 0u, memory_order_relaxed);
         atomic_store_explicit(&c->owner_tx_id, 0, memory_order_relaxed);
-        atomic_store_explicit(&c->written_this_epoch, 0, memory_order_relaxed);
-        bits_clear(e->seg->write_bitmap, e->word_index);
+        atomic_store_explicit(&c->owner_tx_epoch, 0, memory_order_relaxed);
+        // bits_clear(e->seg->write_bitmap, e->word_index);
         write_entry *next = e->next;
         free(e);
         e = next;
@@ -287,12 +289,12 @@ static bool address_to_segment_and_index(region *r, txrecord *t, const void *add
 
     if (!segment)
     {
-        printf("no segment found for segment id %u\n", segment_id);
+        // printf("no segment found for segment id %u\n", segment_id);
         return false;
     }
     if (word_index >= segment->words)
     {
-        printf("word index %zu out of range for segment id %u\n", word_index, segment_id);
+        // printf("word index %zu out of range for segment id %u\n", word_index, segment_id);
         return false;
     }
     out->seg = segment;
@@ -481,10 +483,8 @@ void epoch_boundary(void *ctx)
 
     // 1) Writes
     segment_node *whead;
-    pthread_mutex_lock(&r->written_lock);
     whead = r->written;
     r->written = NULL;
-    pthread_mutex_unlock(&r->written_lock);
 
     while (whead)
     {
@@ -558,27 +558,27 @@ void epoch_boundary(void *ctx)
  **/
 shared_t tm_create(size_t unused(size), size_t unused(align))
 {
-    printf("ola cheguei ao tm_create\n");
+    // printf("ola cheguei ao tm_create\n");
     if (!is_power_of_2(align))
     {
-        printf("align nao é power of 2\n");
+        // printf("align nao é power of 2\n");
         return invalid_shared;
     }
     if (size == 0 || size % align != 0)
     {
-        printf("size is zero or not a multiple of align\n");
+        // printf("size is zero or not a multiple of align\n");
         return invalid_shared;
     }
     if (size > (1ULL << 48))
     {
-        printf("size is too big\n");
+        // printf("size is too big\n");
         return invalid_shared;
     }
 
     region *region = (struct region *)malloc(sizeof(struct region));
     if (unlikely(!region))
     {
-        printf("failed to allocate region\n");
+        // printf("failed to allocate region\n");
         return invalid_shared;
     }
 
@@ -591,7 +591,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     if (!region->segment_table)
     {
         free(region);
-        printf("failed to allocate segment table\n");
+        // printf("failed to allocate segment table\n");
         return invalid_shared;
     }
     region->segment_count = 1;
@@ -603,7 +603,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     {
         free(region->segment_table);
         free(region);
-        printf("failed to allocate base segment\n");
+        // printf("failed to allocate base segment\n");
         return invalid_shared;
     }
     region->segment_table[1] = base;
@@ -617,7 +617,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
     region->allocs = base;
     region->pending_free = NULL;
 
-    printf("tm_create succeeded\n");
+    // printf("tm_create succeeded\n");
     return region;
 }
 
@@ -626,7 +626,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
  **/
 void tm_destroy(shared_t shared)
 {
-    printf("ola cheguei ao tm_destroy\n");
+    // printf("ola cheguei ao tm_destroy\n");
     struct region *region = (struct region *)shared;
     // free all segments
     while (region->allocs)
@@ -649,7 +649,7 @@ void tm_destroy(shared_t shared)
     free(region->segment_table);
     // region
     free(region);
-    printf("tm_destroy succeeded\n");
+    // printf("tm_destroy succeeded\n");
 }
 
 /** [thread-safe] Return the start address of the first allocated segment in the shared memory region.
@@ -668,7 +668,7 @@ void *tm_start(shared_t unused(shared))
  **/
 size_t tm_size(shared_t shared)
 {
-    printf("tm_size called e vou retornar %zu\n", ((struct region *)shared)->size);
+    // printf("tm_size called e vou retornar %zu\n", ((struct region *)shared)->size);
     return ((struct region *)shared)->size;
 }
 
@@ -678,7 +678,7 @@ size_t tm_size(shared_t shared)
  **/
 size_t tm_align(shared_t shared)
 {
-    printf("tm_align called e vou retornar %zu\n", ((struct region *)shared)->align);
+    // printf("tm_align called e vou retornar %zu\n", ((struct region *)shared)->align);
     return ((struct region *)shared)->align;
 }
 
@@ -690,14 +690,14 @@ size_t tm_align(shared_t shared)
 tx_t tm_begin(shared_t shared, bool is_ro)
 {
     // TODO: what are failure conditions ?
-    // printf("tm_begin called\n");
+    // //printf("tm_begin called\n");
 
     region *r = (region *)shared;
 
     txrecord *t = (txrecord *)malloc(sizeof(txrecord));
     if (unlikely(!t))
     {
-        printf("failed to allocate transaction record\n");
+        // printf("failed to allocate transaction record\n");
         return invalid_tx;
     }
 
@@ -708,16 +708,13 @@ tx_t tm_begin(shared_t shared, bool is_ro)
     t->write_list = NULL;
     t->allocated_segments = NULL;
 
-    // printf("about to enter batcher\n");
-    enter_batcher(&r->batcher);
-    // printf("entered batcher\n");
-    t->epoch = get_epoch(&r->batcher);
-    //  printf("got epoch %u\n", t->epoch);
+    // //printf("about to enter batcher\n");
+    t->epoch = enter_batcher(&r->batcher);
     uint32_t id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
     if (id == 0)
         id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
     t->id = id;
-    // printf("tm_begin succeeded with tx id %u\n", t->id);
+    // //printf("tm_begin succeeded with tx id %u\n", t->id);
     return (tx_t)t;
 }
 
@@ -753,8 +750,6 @@ bool tm_end(shared_t shared, tx_t tx)
         write_entry *e = t->write_list;
         while (e)
         {
-            // bits_set(segment->write_bitmap, word_index);
-            // add_written_segment(r, segment);
             bits_set(e->seg->write_bitmap, e->word_index);
             add_written_segment(r, e->seg);
             write_entry *next = e->next;
@@ -770,22 +765,23 @@ bool tm_end(shared_t shared, tx_t tx)
             segment_node *next = sn->next;
 
             // TODO: acho que nao é preciso este mutex porque cada id so pode ir para uma tx
-            pthread_mutex_lock(&r->segments_lock);
+            // pthread_mutex_lock(&r->segments_lock);
             r->segment_table[sn->id] = sn;
             sn->prev = NULL;
             sn->next = r->allocs;
             if (sn->next)
                 sn->next->prev = sn;
             r->allocs = sn;
-            pthread_mutex_unlock(&r->segments_lock);
+            // pthread_mutex_unlock(&r->segments_lock);
             sn = next;
         }
         t->allocated_segments = NULL;
     }
+    /* wont be called
     else
     {
         abort_tx(r, t);
-    }
+    }*/
 
     leave_batcher(&r->batcher, r);
     free(t);
@@ -808,24 +804,14 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
 
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
-    // printf("called tm_read (tx with id %u)\n", t->id);
+    // //printf("called tm_read (tx with id %u)\n", t->id);
 
     if (!r || size == 0 || (size % r->align) != 0)
-    {
-        // t->aborted = true;
-        // return false;
-        printf("invalid read parameters\n");
         return abort_tx(r, t);
-    }
 
     segment_and_index si;
     if (!address_to_segment_and_index(r, t, source, &si))
-    {
-        // t->aborted = true;
-        // return false;
-        printf("address_to_segment_and_index failed in tm_read\n");
         return abort_tx(r, t);
-    }
 
     size_t words = size / r->align;
     uint8_t *out = (uint8_t *)target;
@@ -835,21 +821,12 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
     {
 
         if (si.word_index >= si.seg->words)
-        {
-            // t->aborted = true;
-            // return false;
-            printf("word index out of range in tm_read\n");
             return abort_tx(r, t);
-        }
+
         if (!read_word(r, t, si.seg, si.word_index, out))
-        {
-            // t->aborted = true;
-            // return false;
-            // printf("read_word failed in tm_read with transaction id %u\n and epoch %u", t->id, t->epoch);
             return abort_tx(r, t);
-        }
     }
-    // printf("tm_read succeeded (tx with id %u and epoch %u)\n", t->id, t->epoch);
+    // //printf("tm_read succeeded (tx with id %u and epoch %u)\n", t->id, t->epoch);
     return true;
 }
 
@@ -869,24 +846,14 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
 
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
-    // printf("called tm_write (tx with id %u)\n", t->id);
+    // //printf("called tm_write (tx with id %u)\n", t->id);
 
     if (!r || size == 0 || (size % r->align) != 0)
-    {
-        // t->aborted = true;
-        // return false;
-        printf("invalid write parameters\n");
         return abort_tx(r, t);
-    }
 
     segment_and_index si;
     if (!address_to_segment_and_index(r, t, target, &si))
-    {
-        // t->aborted = true;
-        // return false;
-        printf("address_to_segment_and_index failed in tm_write\n");
         return abort_tx(r, t);
-    }
 
     size_t words = size / r->align;
     uint8_t const *in = (uint8_t const *)source;
@@ -895,21 +862,12 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     for (size_t i = 0; i < words; ++i, ++si.word_index, in += r->align)
     {
         if (si.word_index >= si.seg->words)
-        {
-            // t->aborted = true;
-            // return false;
-            printf("word index out of range in tm_write\n");
             return abort_tx(r, t);
-        }
+
         if (!write_word(r, t, si.seg, si.word_index, in))
-        {
-            // t->aborted = true;
-            // return false;
-            // printf("write_word failed in tm_write for transaction with id %u\n", t->id);
             return abort_tx(r, t);
-        }
     }
-    // printf("tm_write succeeded (tx with id %u)\n", t->id);
+    // //printf("tm_write succeeded (tx with id %u)\n", t->id);
     return true;
 }
 
@@ -933,16 +891,16 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
-    // printf("called tm_alloc (tx with id %u)\n", t->id);
+    // //printf("called tm_alloc (tx with id %u)\n", t->id);
     if (!r || !target)
     {
-        printf("invalid parameters in tm_alloc\n");
+        // printf("invalid parameters in tm_alloc\n");
         abort_tx(r, t);
         return abort_alloc;
     }
     if (size == 0 || (size % r->align) != 0)
     {
-        printf("invalid size in tm_alloc\n");
+        // printf("invalid size in tm_alloc\n");
         abort_tx(r, t);
         return abort_alloc;
     }
@@ -951,7 +909,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     if (r->segment_count == MAX_SEGMENTS)
     {
         pthread_mutex_unlock(&r->segments_lock);
-        printf("no more segment IDs available in tm_alloc\n");
+        // printf("no more segment IDs available in tm_alloc\n");
         return nomem_alloc;
     }
     uint16_t segment_id = ++r->segment_count;
@@ -959,7 +917,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     segment_node *sn = allocate_segment(r, segment_id, size);
     if (!sn)
     {
-        printf("failed to allocate new segment in tm_alloc\n");
+        // printf("failed to allocate new segment in tm_alloc\n");
         return nomem_alloc;
     }
 
@@ -969,24 +927,8 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
         sn->next->prev = sn;
     t->allocated_segments = sn;
     *target = encode_pointer(segment_id, 0);
-    printf("tm_alloc succeeded (tx with id %u), segment id %u\n", t->id, segment_id);
-    return success_alloc;
-
-    /*pthread_mutex_lock(&r->segments_lock);
-    r->segment_table[segment_id] = sn;
-    pthread_mutex_unlock(&r->segments_lock);
-
-    pthread_mutex_lock(&r->segments_lock);
-    sn->prev = NULL;
-    sn->next = r->allocs;
-    if (sn->next)
-        sn->next->prev = sn;
-    r->allocs = sn;
-    pthread_mutex_unlock(&r->segments_lock);
-
-    *target = encode_pointer(segment_id, 0);
     // printf("tm_alloc succeeded (tx with id %u), segment id %u\n", t->id, segment_id);
-    return success_alloc;*/
+    return success_alloc;
 }
 
 /** [thread-safe] Memory freeing in the given transaction.
@@ -1005,17 +947,17 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
 
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
-    printf("called tm_free (tx with id %u)\n", t->id);
+    // printf("called tm_free (tx with id %u)\n", t->id);
     if (!r || !target || !t)
     {
-        printf("invalid parameters in tm_free\n");
+        // printf("invalid parameters in tm_free\n");
         return abort_tx(r, t);
     }
 
     uint16_t segment_id = get_segment_id_from_pointer(target);
     if (segment_id < 2)
     { // base
-        printf("attempt to free invalid segment in tm_free\n");
+        // printf("attempt to free invalid segment in tm_free\n");
         return abort_tx(r, t);
     }
 
@@ -1051,7 +993,7 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     segment_node *s = r->segment_table[segment_id];
     if (!s)
     {
-        printf("attempt to free non-existing segment in tm_free\n");
+        // printf("attempt to free non-existing segment in tm_free\n");
         return abort_tx(r, t);
     }
 
@@ -1062,12 +1004,12 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
         uint32_t ownerId = atomic_load_explicit(&c->owner_tx_id, memory_order_acquire);
         if ((ownerEpoch == t->epoch && ownerId != t->id))
         {
-            printf("attempt to free segment in use by another transaction in tm_free\n");
+            // printf("attempt to free segment in use by another transaction in tm_free\n");
             return abort_tx(r, t);
         }
     }
 
     bitmap_set(t->free_map, segment_id);
-    printf("tm_free succeeded (tx with id %u)\n", t->id);
+    // printf("tm_free succeeded (tx with id %u)\n", t->id);
     return true;
 }

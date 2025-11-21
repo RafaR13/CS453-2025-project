@@ -18,7 +18,7 @@ typedef struct batcher
 // API do batcher
 void batcher_init(batcher *bat);
 void batcher_destroy(batcher *bat);
-void enter_batcher(batcher *bat);
+uint32_t enter_batcher(batcher *bat);
 bool leave_batcher(batcher *bat, void *region);
 uint32_t get_epoch(batcher *bat);
 

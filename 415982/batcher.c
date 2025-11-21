@@ -14,14 +14,15 @@ uint32_t get_epoch(batcher *bat)
     return epoch;
 }
 
-void enter_batcher(batcher *bat)
+uint32_t enter_batcher(batcher *bat)
 {
     pthread_mutex_lock(&bat->lock);
     if (bat->remaining == 0)
     {
         bat->remaining = 1;
+        uint32_t epoch = bat->counter;
         pthread_mutex_unlock(&bat->lock);
-        return;
+        return epoch;
     }
 
     bat->waiting++;
@@ -30,7 +31,9 @@ void enter_batcher(batcher *bat)
     {
         pthread_cond_wait(&bat->cond, &bat->lock);
     } while (my_epoch == bat->counter);
+    uint32_t epoch = bat->counter;
     pthread_mutex_unlock(&bat->lock);
+    return epoch;
 }
 
 bool leave_batcher(batcher *bat, void *region)
