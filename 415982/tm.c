@@ -33,7 +33,7 @@
 #include <tm.h>
 
 void epoch_boundary(void *ctx);
-#include "batcher.h"
+#include "batcher2.h"
 
 #include "macros.h"
 
@@ -51,8 +51,7 @@ typedef struct
 {
     _Atomic bool readable_copy;          // 0 if A, 1 if B
     _Atomic uint32_t written_this_epoch; // if its equal to the current epoch, then someone has written this epoch
-    _Atomic uint32_t owner_tx_epoch;     // epoch of the transaction that owns this word
-    _Atomic uint32_t owner_tx_id;        // id of the transaction that owns this word
+    _Atomic uint64_t owner;              // epoch || txid
 } ctrl;
 
 typedef struct segment_node
@@ -203,10 +202,8 @@ static inline bool abort_tx(region *r, txrecord *t)
     while (e)
     {
         ctrl *c = &e->seg->control[e->word_index];
-        atomic_store_explicit(&c->written_this_epoch, 0u, memory_order_relaxed);
-        atomic_store_explicit(&c->owner_tx_id, 0, memory_order_relaxed);
-        atomic_store_explicit(&c->owner_tx_epoch, 0, memory_order_relaxed);
-        // bits_clear(e->seg->write_bitmap, e->word_index);
+        // atomic_store_explicit(&c->written_this_epoch, 0u, memory_order_relaxed);
+        // atomic_store_explicit(&c->owner, 0u, memory_order_relaxed);
         write_entry *next = e->next;
         free(e);
         e = next;
@@ -362,8 +359,7 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     {
         atomic_init(&sn->control[i].readable_copy, false);
         atomic_init(&sn->control[i].written_this_epoch, 0u);
-        atomic_init(&sn->control[i].owner_tx_id, 0u);
-        atomic_init(&sn->control[i].owner_tx_epoch, 0u);
+        atomic_init(&sn->control[i].owner, 0u);
     }
 
     // bitmap
@@ -406,8 +402,9 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
 
     if (written == t->epoch /* the word has been written in the current epoch*/)
     {
-        uint32_t ownerEpoch = atomic_load_explicit(&c->owner_tx_epoch, memory_order_acquire);
-        uint32_t ownerId = atomic_load_explicit(&c->owner_tx_id, memory_order_acquire);
+        uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
+        uint32_t ownerEpoch = (uint32_t)(expected >> 32);
+        uint32_t ownerId = (uint32_t)(expected & 0xFFFFFFFFu);
 
         // if transaction is not in the access set, abort
         if (!(ownerEpoch == t->epoch && ownerId == t->id))
@@ -420,12 +417,11 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
     }
 
     // im now the owner (if there wasnt one already in this epoch)
-    uint32_t ownerEpoch = atomic_load(&c->owner_tx_epoch);
-    if (ownerEpoch != t->epoch)
-    {
-        atomic_store_explicit(&c->owner_tx_epoch, t->epoch, memory_order_release);
-        atomic_store_explicit(&c->owner_tx_id, t->id, memory_order_release);
-    }
+
+    uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
+    if ((uint32_t)(expected >> 32) != t->epoch)
+        atomic_compare_exchange_strong_explicit(&c->owner, &expected, ((uint64_t)t->epoch << 32) | t->id, memory_order_acq_rel, memory_order_acquire);
+
     // read the readable copy into target
     bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(target, readable_ptr(segment, word_index, rc), r->align);
@@ -439,8 +435,9 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
     uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
     if (written == t->epoch)
     {
-        uint32_t ownerEpoch = atomic_load_explicit(&c->owner_tx_epoch, memory_order_acquire);
-        uint32_t ownerId = atomic_load_explicit(&c->owner_tx_id, memory_order_acquire);
+        uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
+        uint32_t ownerEpoch = (uint32_t)(expected >> 32);
+        uint32_t ownerId = (uint32_t)(expected & 0xFFFFFFFFu);
 
         if (!(ownerId == t->id && ownerEpoch == t->epoch))
             return false;
@@ -451,16 +448,25 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
     }
 
     // word hasnt been written this epoch yet
-    uint32_t ownerEpoch = atomic_load_explicit(&c->owner_tx_epoch, memory_order_acquire);
-    uint32_t ownerId = atomic_load_explicit(&c->owner_tx_id, memory_order_acquire);
+    uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
+    uint32_t ownerEpoch = (uint32_t)(expected >> 32);
+    uint32_t ownerId = (uint32_t)(expected & 0xFFFFFFFFu);
 
     if (ownerEpoch == t->epoch && ownerId != t->id)
+        // someone else is in the access set
         return false;
 
-    // im now the owner
-    atomic_store_explicit(&c->owner_tx_epoch, t->epoch, memory_order_release);
-    atomic_store_explicit(&c->owner_tx_id, t->id, memory_order_release);
+    // try to get ownership, if it doesnt work abort
+    if (!atomic_compare_exchange_strong_explicit(&c->owner, &expected, ((uint64_t)t->epoch << 32) | t->id, memory_order_acq_rel, memory_order_acquire))
+        // someone else got in the access set in the meantime
+        return false;
+
+    // mark that the word has been written this epoch
     atomic_store_explicit(&c->written_this_epoch, t->epoch, memory_order_release);
+
+    // atomic_store_explicit(&c->owner_tx_epoch, t->epoch, memory_order_release);
+    // atomic_store_explicit(&c->owner_tx_id, t->id, memory_order_release);
+    // atomic_store_explicit(&c->written_this_epoch, t->epoch, memory_order_release);
 
     // write to writable copy
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -763,25 +769,16 @@ bool tm_end(shared_t shared, tx_t tx)
         while (sn)
         {
             segment_node *next = sn->next;
-
-            // TODO: acho que nao é preciso este mutex porque cada id so pode ir para uma tx
-            // pthread_mutex_lock(&r->segments_lock);
             r->segment_table[sn->id] = sn;
             sn->prev = NULL;
             sn->next = r->allocs;
             if (sn->next)
                 sn->next->prev = sn;
             r->allocs = sn;
-            // pthread_mutex_unlock(&r->segments_lock);
             sn = next;
         }
         t->allocated_segments = NULL;
     }
-    /* wont be called
-    else
-    {
-        abort_tx(r, t);
-    }*/
 
     leave_batcher(&r->batcher, r);
     free(t);
@@ -894,13 +891,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     // //printf("called tm_alloc (tx with id %u)\n", t->id);
     if (!r || !target)
     {
-        // printf("invalid parameters in tm_alloc\n");
+        printf("invalid parameters in tm_alloc\n");
         abort_tx(r, t);
         return abort_alloc;
     }
     if (size == 0 || (size % r->align) != 0)
     {
-        // printf("invalid size in tm_alloc\n");
+        printf("invalid size in tm_alloc\n");
         abort_tx(r, t);
         return abort_alloc;
     }
@@ -909,7 +906,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     if (r->segment_count == MAX_SEGMENTS)
     {
         pthread_mutex_unlock(&r->segments_lock);
-        // printf("no more segment IDs available in tm_alloc\n");
+        printf("no more segment IDs available in tm_alloc\n");
         return nomem_alloc;
     }
     uint16_t segment_id = ++r->segment_count;
@@ -917,7 +914,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
     segment_node *sn = allocate_segment(r, segment_id, size);
     if (!sn)
     {
-        // printf("failed to allocate new segment in tm_alloc\n");
+        printf("failed to allocate new segment in tm_alloc\n");
         return nomem_alloc;
     }
 
@@ -1000,8 +997,9 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     for (size_t i = 0; i < s->words; i++)
     {
         ctrl *c = &s->control[i];
-        uint32_t ownerEpoch = atomic_load_explicit(&c->owner_tx_epoch, memory_order_acquire);
-        uint32_t ownerId = atomic_load_explicit(&c->owner_tx_id, memory_order_acquire);
+        uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
+        uint32_t ownerEpoch = (uint32_t)(expected >> 32);
+        uint32_t ownerId = (uint32_t)(expected & 0xFFFFFFFFu);
         if ((ownerEpoch == t->epoch && ownerId != t->id))
         {
             // printf("attempt to free segment in use by another transaction in tm_free\n");
