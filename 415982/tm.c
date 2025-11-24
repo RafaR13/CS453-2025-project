@@ -478,7 +478,7 @@ void epoch_boundary(void *ctx)
         // corta encadeamento e (por segurança) limpa flag
         sn->next_free = NULL;
         // TODO: maybe unnecessary
-        atomic_store_explicit(&sn->pending_free, 0, memory_order_relaxed);
+        // atomic_store_explicit(&sn->pending_free, 0, memory_order_relaxed);
 
         // remove de estruturas (allocs/segment_table) e libera memória
         if (sn->prev)
@@ -510,19 +510,9 @@ void epoch_boundary(void *ctx)
 shared_t tm_create(size_t unused(size), size_t unused(align))
 {
     // printf("ola cheguei ao tm_create\n");
-    if (!is_power_of_2(align))
+    if (!is_power_of_2(align) || size == 0 || size % align != 0 || size > (1ULL << 48))
     {
         // printf("align nao é power of 2\n");
-        return invalid_shared;
-    }
-    if (size == 0 || size % align != 0)
-    {
-        // printf("size is zero or not a multiple of align\n");
-        return invalid_shared;
-    }
-    if (size > (1ULL << 48))
-    {
-        // printf("size is too big\n");
         return invalid_shared;
     }
 
