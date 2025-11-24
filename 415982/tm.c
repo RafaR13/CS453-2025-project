@@ -33,7 +33,7 @@
 #include <tm.h>
 
 void epoch_boundary(void *ctx);
-#include "batcher2.h"
+#include "batcher.h"
 
 #include "macros.h"
 
