@@ -91,7 +91,6 @@ typedef struct region
 {
     // batcher stuff
     batcher batcher;
-    pthread_mutex_t segments_lock;
     pthread_mutex_t written_lock;
     pthread_mutex_t free_lock;
     _Atomic uint32_t transaction_id_counter;
@@ -104,7 +103,7 @@ typedef struct region
 
     // tabela de segments
     segment_node **segment_table;
-    uint32_t segment_count;
+    _Atomic uint16_t segment_count;
 
     size_t align; // size of a word
     uint32_t log2_align;
@@ -600,7 +599,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         // printf("failed to allocate segment table\n");
         return invalid_shared;
     }
-    region->segment_count = 1;
+    atomic_init(&region->segment_count, 2);
     atomic_init(&region->transaction_id_counter, 1);
 
     // base segment
@@ -617,7 +616,6 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
 
     // initialize batcher
     batcher_init(&region->batcher);
-    pthread_mutex_init(&region->segments_lock, NULL);
     pthread_mutex_init(&region->written_lock, NULL);
     pthread_mutex_init(&region->free_lock, NULL);
     region->allocs = base;
@@ -647,8 +645,6 @@ void tm_destroy(shared_t shared)
     }
     // batcher
     batcher_destroy(&region->batcher);
-    // segments_lock
-    pthread_mutex_destroy(&region->segments_lock);
     pthread_mutex_destroy(&region->written_lock);
     pthread_mutex_destroy(&region->free_lock);
     // segment table
@@ -902,15 +898,13 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
         return abort_alloc;
     }
 
-    pthread_mutex_lock(&r->segments_lock);
-    if (r->segment_count == MAX_SEGMENTS)
+    uint16_t segment_id = atomic_fetch_add_explicit(&r->segment_count, 1, memory_order_acq_rel);
+    if (segment_id >= MAX_SEGMENTS)
     {
-        pthread_mutex_unlock(&r->segments_lock);
         printf("no more segment IDs available in tm_alloc\n");
         return nomem_alloc;
     }
-    uint16_t segment_id = ++r->segment_count;
-    pthread_mutex_unlock(&r->segments_lock);
+
     segment_node *sn = allocate_segment(r, segment_id, size);
     if (!sn)
     {
