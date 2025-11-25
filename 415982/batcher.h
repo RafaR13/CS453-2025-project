@@ -13,13 +13,17 @@ typedef struct batcher
     uint32_t counter;   // current epoch
     uint32_t remaining; // number of active transactions
     uint32_t waiting;   // threads waiting
+
+    // bool completed_rw_txs;
+    // bool started_rw_txs;
+    //  talvez flag de quantas txs rw entraram
 } batcher;
 
 // API do batcher
 void batcher_init(batcher *bat);
 void batcher_destroy(batcher *bat);
-uint32_t enter_batcher(batcher *bat);
-bool leave_batcher(batcher *bat, void *region);
+uint32_t enter_batcher(batcher *bat, bool is_ro);
+bool leave_batcher(batcher *bat, void *region, bool is_ro);
 uint32_t get_epoch(batcher *bat);
 
 #endif // BATCHER_H

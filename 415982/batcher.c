@@ -14,16 +14,37 @@ uint32_t get_epoch(batcher *bat)
     return epoch;
 }
 
-uint32_t enter_batcher(batcher *bat)
+uint32_t enter_batcher(batcher *bat, bool is_ro)
 {
     pthread_mutex_lock(&bat->lock);
     if (bat->remaining == 0)
     {
         bat->remaining = 1;
         uint32_t epoch = bat->counter;
+        // bat->completed_rw_txs = false;
+        // if (!is_ro)
+        //     bat->started_rw_txs = true;
         pthread_mutex_unlock(&bat->lock);
         return epoch;
     }
+
+    /*if (!bat->started_rw_txs)
+    {
+        if (!is_ro && !bat->started_rw_txs)
+            bat->started_rw_txs = true;
+        bat->remaining++;
+        uint32_t epoch = bat->counter;
+        pthread_mutex_unlock(&bat->lock);
+        return epoch;
+    }
+
+    if (!bat->completed_rw_txs && is_ro)
+    {
+        bat->remaining++;
+        uint32_t epoch = bat->counter;
+        pthread_mutex_unlock(&bat->lock);
+        return epoch;
+    }*/
 
     bat->waiting++;
     uint32_t my_epoch = bat->counter;
@@ -31,18 +52,23 @@ uint32_t enter_batcher(batcher *bat)
     {
         pthread_cond_wait(&bat->cond, &bat->lock);
     } while (my_epoch == bat->counter);
+    // if (!is_ro && !bat->started_rw_txs)
+    //     bat->started_rw_txs = true;
     uint32_t epoch = bat->counter;
     pthread_mutex_unlock(&bat->lock);
     return epoch;
 }
 
-bool leave_batcher(batcher *bat, void *region)
+bool leave_batcher(batcher *bat, void *region, bool is_ro)
 {
     pthread_mutex_lock(&bat->lock);
 
     bat->remaining--;
+
     if (bat->remaining > 0)
     {
+        // if (!is_ro)
+        //     bat->completed_rw_txs = true;
         pthread_mutex_unlock(&bat->lock);
         return false;
     }
@@ -51,10 +77,12 @@ bool leave_batcher(batcher *bat, void *region)
     bat->counter++;
     bat->remaining = bat->waiting;
     bat->waiting = 0;
+    // bat->completed_rw_txs = false;
+    // bat->started_rw_txs = false;
 
     // epoch_boundary(region) continua definido em tm.c
     if (region)
-        epoch_boundary(region); // <- vamos declarar isto como extern em tm.c
+        epoch_boundary(region);
 
     pthread_cond_broadcast(&bat->cond);
     pthread_mutex_unlock(&bat->lock);
@@ -68,6 +96,8 @@ void batcher_init(batcher *bat)
     bat->counter = 1;
     bat->remaining = 0;
     bat->waiting = 0;
+    // bat->completed_rw_txs = false;
+    // bat->started_rw_txs = false;
 }
 
 void batcher_destroy(batcher *bat)

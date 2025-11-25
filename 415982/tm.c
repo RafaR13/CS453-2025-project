@@ -120,7 +120,7 @@ typedef struct
     uint32_t id;
 
     // pending frees
-    uint64_t free_map[MAX_SEGMENTS / 64];
+    uint64_t *free_map; //[MAX_SEGMENTS / 64];
     segment_node *allocated_segments;
     ctrl *written_head;
     ctrl *written_tail;
@@ -145,23 +145,6 @@ static inline uint8_t *readable_ptr(segment_node *seg, size_t index, bool readab
 static inline uint8_t *writable_ptr(segment_node *seg, size_t index, bool readable_copy)
 {
     return readable_copy ? (seg->copyA + index * seg->align) : (seg->copyB + index * seg->align);
-}
-
-static inline void clear_bitmap_writes(uint8_t *bitmap, size_t bytes)
-{
-    memset(bitmap, 0, bytes);
-}
-
-static inline void bits_set(uint8_t *bits, size_t idx)
-{
-    size_t byte = idx >> 3;
-    uint8_t mask = (uint8_t)(1u << (idx & 7));
-    atomic_fetch_or_explicit((_Atomic uint8_t *)&bits[byte], mask, memory_order_acq_rel);
-}
-
-static inline void bits_clear(uint8_t *bits, size_t idx)
-{
-    bits[idx >> 3] &= (uint8_t)~(1u << (idx & 7));
 }
 
 static inline int is_power_of_2(size_t x) { return x && ((x & (x - 1)) == 0); }
@@ -212,7 +195,9 @@ static inline bool abort_tx(region *r, txrecord *t)
     }
     t->allocated_segments = NULL;
 
-    leave_batcher(&r->batcher, r);
+    leave_batcher(&r->batcher, r, t->is_ro);
+    if (t->free_map)
+        free(t->free_map);
     free(t);
     return false;
 }
@@ -640,14 +625,15 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 
     t->is_ro = is_ro;
     t->aborted = false;
+    t->free_map = NULL;
 
-    clear_bitmap(t->free_map);
+    // clear_bitmap(t->free_map);
     t->allocated_segments = NULL;
     t->written_head = NULL;
     t->written_tail = NULL;
 
     // //printf("about to enter batcher\n");
-    t->epoch = enter_batcher(&r->batcher);
+    t->epoch = enter_batcher(&r->batcher, is_ro);
     uint32_t id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
     if (id == 0)
         id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
@@ -669,20 +655,23 @@ bool tm_end(shared_t shared, tx_t tx)
 
     if (committed)
     {
-        for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
+        if (t->free_map)
         {
-            uint64_t bm = t->free_map[i];
-            if (!bm)
-                continue;
-            const uint32_t base = i << 6;
-            while (bm)
+            for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
             {
-                unsigned b = (unsigned)__builtin_ctzll(bm);
-                uint16_t seg = (uint16_t)(base + b);
-                segment_node *sn = r->segment_table[seg];
-                if (sn)
-                    add_pending_free(r, sn);
-                bm &= (bm - 1);
+                uint64_t bm = t->free_map[i];
+                if (!bm)
+                    continue;
+                const uint32_t base = i << 6;
+                while (bm)
+                {
+                    unsigned b = (unsigned)__builtin_ctzll(bm);
+                    uint16_t seg = (uint16_t)(base + b);
+                    segment_node *sn = r->segment_table[seg];
+                    if (sn)
+                        add_pending_free(r, sn);
+                    bm &= (bm - 1);
+                }
             }
         }
 
@@ -711,7 +700,9 @@ bool tm_end(shared_t shared, tx_t tx)
         t->allocated_segments = NULL;
     }
 
-    leave_batcher(&r->batcher, r);
+    leave_batcher(&r->batcher, r, t->is_ro);
+    if (t->free_map)
+        free(t->free_map);
     free(t);
     return committed;
 }
@@ -922,7 +913,15 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
         // printf("attempt to free non-existing segment in tm_free\n");
         return abort_tx(r, t);
     }
-
+    if (!t->free_map)
+    {
+        t->free_map = (uint64_t *)calloc(MAX_SEGMENTS / 64, sizeof(uint64_t));
+        if (!t->free_map)
+        {
+            // printf("failed to allocate free_map in tm_free\n");
+            return abort_tx(r, t);
+        }
+    }
     bitmap_set(t->free_map, segment_id);
     // printf("tm_free succeeded (tx with id %u)\n", t->id);
     return true;
