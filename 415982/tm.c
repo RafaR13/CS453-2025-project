@@ -41,6 +41,7 @@ void epoch_boundary(void *ctx);
 #define WORD_INDEX_BITS 48u
 #define SEGMENT_ID_MASK (MAX_SEGMENTS - 1u)
 #define WORD_INDEX_MASK ((1ULL << WORD_INDEX_BITS) - 1ULL)
+static const tx_t read_only_tx = UINTPTR_MAX - 10;
 
 #define MAX_SEGMENTS (1u << SEGMENT_ID_BITS)
 #define BITSET_BYTES ((MAX_SEGMENTS + 7u) / 8u)
@@ -349,7 +350,7 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
 {
     ctrl *c = &segment->control[word_index];
 
-    if (t->is_ro)
+    if (/*t->is_ro*/ t == read_only_tx)
     {
         // read the readable copy into target
         bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -616,6 +617,12 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 
     region *r = (region *)shared;
 
+    if (is_ro)
+    {
+        enter_batcher(&r->batcher, true);
+        return read_only_tx;
+    }
+
     txrecord *t = (txrecord *)malloc(sizeof(txrecord));
     if (unlikely(!t))
     {
@@ -648,61 +655,62 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 bool tm_end(shared_t shared, tx_t tx)
 {
     region *r = (region *)shared;
-    txrecord *t = get_transaction_record(tx);
-    bool committed = !t->aborted;
-
-    if (committed)
+    if (tx == read_only_tx)
     {
-        if (t->free_map)
+        leave_batcher(&r->batcher, r, true);
+        return true;
+    }
+    txrecord *t = get_transaction_record(tx);
+
+    if (t->free_map)
+    {
+        for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
         {
-            for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
+            uint64_t bm = t->free_map[i];
+            if (!bm)
+                continue;
+            const uint32_t base = i << 6;
+            while (bm)
             {
-                uint64_t bm = t->free_map[i];
-                if (!bm)
-                    continue;
-                const uint32_t base = i << 6;
-                while (bm)
-                {
-                    unsigned b = (unsigned)__builtin_ctzll(bm);
-                    uint16_t seg = (uint16_t)(base + b);
-                    segment_node *sn = r->segment_table[seg];
-                    if (sn)
-                        add_pending_free(r, sn);
-                    bm &= (bm - 1);
-                }
+                unsigned b = (unsigned)__builtin_ctzll(bm);
+                uint16_t seg = (uint16_t)(base + b);
+                segment_node *sn = r->segment_table[seg];
+                if (sn)
+                    add_pending_free(r, sn);
+                bm &= (bm - 1);
             }
         }
-
-        // writes
-        if (t->written_head)
-        {
-            pthread_mutex_lock(&r->written_lock);
-            t->written_tail->next = r->write_list_head;
-            r->write_list_head = t->written_head;
-            pthread_mutex_unlock(&r->written_lock);
-        }
-
-        // alocs
-        segment_node *sn = t->allocated_segments;
-        while (sn)
-        {
-            segment_node *next = sn->next;
-            r->segment_table[sn->id] = sn;
-            sn->prev = NULL;
-            sn->next = r->allocs;
-            if (sn->next)
-                sn->next->prev = sn;
-            r->allocs = sn;
-            sn = next;
-        }
-        t->allocated_segments = NULL;
     }
+
+    // writes
+    if (t->written_head)
+    {
+        pthread_mutex_lock(&r->written_lock);
+        t->written_tail->next = r->write_list_head;
+        r->write_list_head = t->written_head;
+        pthread_mutex_unlock(&r->written_lock);
+    }
+
+    // alocs
+    segment_node *sn = t->allocated_segments;
+    while (sn)
+    {
+        segment_node *next = sn->next;
+        r->segment_table[sn->id] = sn;
+        sn->prev = NULL;
+        sn->next = r->allocs;
+        if (sn->next)
+            sn->next->prev = sn;
+        r->allocs = sn;
+        sn = next;
+    }
+    t->allocated_segments = NULL;
 
     leave_batcher(&r->batcher, r, t->is_ro);
     if (t->free_map)
         free(t->free_map);
     free(t);
-    return committed;
+    return true;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.

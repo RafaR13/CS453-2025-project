@@ -56,7 +56,6 @@ uint64_t enter_batcher(batcher *bat, bool is_ro)
     // we are now in a new epoch
     epoch = bat->counter;
 
-    // for bookkeeping: first RW of the *new* epoch sets started_rw_txs
     if (!is_ro && !bat->started_rw_txs)
         bat->started_rw_txs = true;
 
