@@ -88,7 +88,7 @@ typedef struct region
     batcher batcher;
     pthread_mutex_t written_lock;
     pthread_mutex_t free_lock;
-    _Atomic uint32_t transaction_id_counter;
+    //_Atomic uint32_t transaction_id_counter;
 
     // write list
     ctrl *write_list_head;
@@ -521,7 +521,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
     atomic_init(&region->segment_count, 2);
-    atomic_init(&region->transaction_id_counter, 1);
+    // atomic_init(&region->transaction_id_counter, 1);
 
     // base segment
     segment_node *base = allocate_segment(region, 1, size);
@@ -633,11 +633,9 @@ tx_t tm_begin(shared_t shared, bool is_ro)
     t->written_tail = NULL;
 
     // //printf("about to enter batcher\n");
-    t->epoch = enter_batcher(&r->batcher, is_ro);
-    uint32_t id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
-    if (id == 0)
-        id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
-    t->id = id;
+    uint64_t id_and_epoch = enter_batcher(&r->batcher, is_ro);
+    t->epoch = (uint32_t)(id_and_epoch & 0xFFFFFFFFu);
+    t->id = (uint32_t)(id_and_epoch >> 32);
     // //printf("tm_begin succeeded with tx id %u\n", t->id);
     return (tx_t)t;
 }

@@ -14,52 +14,57 @@ uint32_t get_epoch(batcher *bat)
     return epoch;
 }
 
-uint32_t enter_batcher(batcher *bat, bool is_ro)
+uint64_t enter_batcher(batcher *bat, bool is_ro)
 {
     pthread_mutex_lock(&bat->lock);
+
+    uint32_t id = is_ro ? 0u : bat->tx_id_counter++;
+    uint32_t epoch = bat->counter;
+
     if (bat->remaining == 0)
     {
         bat->remaining = 1;
-        uint32_t epoch = bat->counter;
-        // bat->completed_rw_txs = false;
-        // if (!is_ro)
-        //     bat->started_rw_txs = true;
+        if (!is_ro)
+            bat->started_rw_txs = true; // first RW started
         pthread_mutex_unlock(&bat->lock);
-        return epoch;
+        return ((uint64_t)id << 32) | epoch;
     }
 
-    /*if (!bat->started_rw_txs)
+    if (!bat->started_rw_txs)
     {
-        if (!is_ro && !bat->started_rw_txs)
-            bat->started_rw_txs = true;
         bat->remaining++;
-        uint32_t epoch = bat->counter;
+        if (!is_ro)
+            bat->started_rw_txs = true; // first RW of this epoch
         pthread_mutex_unlock(&bat->lock);
-        return epoch;
+        return ((uint64_t)id << 32) | epoch;
     }
 
     if (!bat->completed_rw_txs && is_ro)
     {
         bat->remaining++;
-        uint32_t epoch = bat->counter;
         pthread_mutex_unlock(&bat->lock);
-        return epoch;
-    }*/
-
+        return ((uint64_t)id << 32) | epoch;
+    }
     bat->waiting++;
-    uint32_t my_epoch = bat->counter;
+    uint32_t my_epoch = epoch;
+
     do
     {
         pthread_cond_wait(&bat->cond, &bat->lock);
     } while (my_epoch == bat->counter);
-    // if (!is_ro && !bat->started_rw_txs)
-    //     bat->started_rw_txs = true;
-    uint32_t epoch = bat->counter;
+
+    // we are now in a new epoch
+    epoch = bat->counter;
+
+    // for bookkeeping: first RW of the *new* epoch sets started_rw_txs
+    if (!is_ro && !bat->started_rw_txs)
+        bat->started_rw_txs = true;
+
     pthread_mutex_unlock(&bat->lock);
-    return epoch;
+    return ((uint64_t)id << 32) | epoch;
 }
 
-bool leave_batcher(batcher *bat, void *region, bool is_ro)
+void leave_batcher(batcher *bat, void *region, bool is_ro)
 {
     pthread_mutex_lock(&bat->lock);
 
@@ -67,26 +72,30 @@ bool leave_batcher(batcher *bat, void *region, bool is_ro)
 
     if (bat->remaining > 0)
     {
-        // if (!is_ro)
-        //     bat->completed_rw_txs = true;
+        if (!is_ro)
+            bat->completed_rw_txs = true;
         pthread_mutex_unlock(&bat->lock);
-        return false;
+        return;
     }
 
     // último da epoch
+    if (!bat->started_rw_txs && is_ro)
+    {
+        // ainda nao começaram rw, por isso nao se troca de epoch
+        pthread_mutex_unlock(&bat->lock);
+        return;
+    }
     bat->counter++;
     bat->remaining = bat->waiting;
     bat->waiting = 0;
-    // bat->completed_rw_txs = false;
-    // bat->started_rw_txs = false;
+    bat->completed_rw_txs = false;
+    bat->started_rw_txs = false;
 
-    // epoch_boundary(region) continua definido em tm.c
     if (region)
         epoch_boundary(region);
 
     pthread_cond_broadcast(&bat->cond);
     pthread_mutex_unlock(&bat->lock);
-    return true;
 }
 
 void batcher_init(batcher *bat)
@@ -94,10 +103,11 @@ void batcher_init(batcher *bat)
     pthread_mutex_init(&bat->lock, NULL);
     pthread_cond_init(&bat->cond, NULL);
     bat->counter = 1;
+    bat->tx_id_counter = 1;
     bat->remaining = 0;
     bat->waiting = 0;
-    // bat->completed_rw_txs = false;
-    // bat->started_rw_txs = false;
+    bat->completed_rw_txs = false;
+    bat->started_rw_txs = false;
 }
 
 void batcher_destroy(batcher *bat)
