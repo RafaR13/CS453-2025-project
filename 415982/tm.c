@@ -50,10 +50,10 @@ static const tx_t read_only_tx = UINTPTR_MAX - 10;
 
 typedef struct ctrl
 {
-    _Atomic bool readable_copy;          // 0 if A, 1 if B
-    _Atomic uint32_t written_this_epoch; // if its equal to the current epoch, then someone has written this epoch
-    _Atomic uint64_t owner;              // epoch || txid
-    struct ctrl *next;                   // linked list of written words
+    _Atomic bool readable_copy;  // 0 if A, 1 if B
+    uint32_t written_this_epoch; // if its equal to the current epoch, then someone has written this epoch
+    _Atomic uint64_t owner;      // epoch || txid
+    struct ctrl *next;           // linked list of written words
 } ctrl;
 
 typedef struct segment_node
@@ -89,7 +89,6 @@ typedef struct region
     batcher batcher;
     pthread_mutex_t written_lock;
     pthread_mutex_t free_lock;
-    //_Atomic uint32_t transaction_id_counter;
 
     // write list
     ctrl *write_list_head;
@@ -105,13 +104,6 @@ typedef struct region
     uint32_t log2_align;
     size_t size; // size of the base segment
 } region;
-
-enum
-{
-    FLAG_READABLE = 1 << 0, // 0 if A, 1 if B
-    FLAG_WRITTEN = 1 << 1,  // 1 if written in this epoch
-    FLAG_LISTED = 1 << 2    // 1 if in the write list
-};
 
 typedef struct
 {
@@ -175,7 +167,7 @@ static inline bool abort_tx(region *r, txrecord *t)
     while (c)
     {
         ctrl *next = c->next;
-        atomic_store_explicit(&c->written_this_epoch, 0u, memory_order_relaxed);
+        c->written_this_epoch = 0u;
         atomic_store_explicit(&c->owner, 0u, memory_order_relaxed);
         c->next = NULL;
         c = next;
@@ -267,7 +259,6 @@ static void add_pending_free(region *r, segment_node *sn)
     if (already_pending)
         return;
 
-    // TODO: será que dá para fazer lock free?
     pthread_mutex_lock(&r->free_lock);
     sn->next_free = r->pending_free;
     r->pending_free = sn;
@@ -317,28 +308,15 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
     for (size_t i = 0; i < words; i++)
     {
         atomic_init(&sn->control[i].readable_copy, false);
-        atomic_init(&sn->control[i].written_this_epoch, 0u);
+
+        sn->control[i].written_this_epoch = 0u;
         atomic_init(&sn->control[i].owner, 0u);
         sn->control[i].next = NULL;
     }
 
-    // bitmap
-    /*size_t bitmap_bytes = (words + 7u) / 8u;
-    sn->write_bitmap = (uint8_t *)calloc(bitmap_bytes, 1);
-    if (!sn->write_bitmap)
-    {
-        free(sn->control);
-        free(sn->copyA);
-        free(sn->copyB);
-        free(sn);
-        return NULL;
-    }*/
-
     sn->next = NULL;
     sn->prev_free = sn->next_free = NULL;
     atomic_init(&sn->pending_free, false);
-    // sn->next_write = NULL;
-    // atomic_init(&sn->written_in_epoch, false);
     return sn;
 }
 
@@ -350,7 +328,7 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
 {
     ctrl *c = &segment->control[word_index];
 
-    if (/*t->is_ro*/ t == read_only_tx)
+    if (t == read_only_tx)
     {
         // read the readable copy into target
         bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -358,7 +336,7 @@ static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word
         return true;
     }
 
-    uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+    uint32_t written = c->written_this_epoch;
 
     if (written == t->epoch /* the word has been written in the current epoch*/)
     {
@@ -392,7 +370,7 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
 {
     ctrl *c = &segment->control[word_index];
 
-    uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+    uint32_t written = c->written_this_epoch;
     if (written == t->epoch)
     {
         uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
@@ -422,7 +400,7 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, size_t wor
         return false;
 
     // mark that the word has been written this epoch
-    atomic_store_explicit(&c->written_this_epoch, t->epoch, memory_order_release);
+    c->written_this_epoch = t->epoch;
 
     // write to writable copy
     bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -464,7 +442,6 @@ void epoch_boundary(void *ctx)
         // corta encadeamento e (por segurança) limpa flag
         sn->next_free = NULL;
         // TODO: maybe unnecessary
-        // atomic_store_explicit(&sn->pending_free, 0, memory_order_relaxed);
 
         // remove de estruturas (allocs/segment_table) e libera memória
         if (sn->prev)
@@ -522,7 +499,6 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
     atomic_init(&region->segment_count, 2);
-    // atomic_init(&region->transaction_id_counter, 1);
 
     // base segment
     segment_node *base = allocate_segment(region, 1, size);
@@ -581,7 +557,6 @@ void tm_destroy(shared_t shared)
  **/
 void *tm_start(shared_t unused(shared))
 {
-    // return ((struct region *)shared)->start;
     return encode_pointer(1, 0);
 }
 
@@ -591,7 +566,6 @@ void *tm_start(shared_t unused(shared))
  **/
 size_t tm_size(shared_t shared)
 {
-    // printf("tm_size called e vou retornar %zu\n", ((struct region *)shared)->size);
     return ((struct region *)shared)->size;
 }
 
@@ -601,7 +575,6 @@ size_t tm_size(shared_t shared)
  **/
 size_t tm_align(shared_t shared)
 {
-    // printf("tm_align called e vou retornar %zu\n", ((struct region *)shared)->align);
     return ((struct region *)shared)->align;
 }
 
@@ -612,9 +585,6 @@ size_t tm_align(shared_t shared)
  **/
 tx_t tm_begin(shared_t shared, bool is_ro)
 {
-    // TODO: what are failure conditions ?
-    // //printf("tm_begin called\n");
-
     region *r = (region *)shared;
 
     if (is_ro)
@@ -634,7 +604,6 @@ tx_t tm_begin(shared_t shared, bool is_ro)
     t->aborted = false;
     t->free_map = NULL;
 
-    // clear_bitmap(t->free_map);
     t->allocated_segments = NULL;
     t->written_head = NULL;
     t->written_tail = NULL;
@@ -723,10 +692,6 @@ bool tm_end(shared_t shared, tx_t tx)
  **/
 bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO (checks): size must be positive multiple of alignment
-    // source and target must be at least size bytes long
-    // source and target addresses must be a positive multiple of alignment
-
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     // //printf("called tm_read (tx with id %u)\n", t->id);
@@ -765,10 +730,6 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
  **/
 bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *target)
 {
-    // TODO (checks): size must be positive multiple of alignment
-    // source and target must be at least size bytes long
-    // source and target addresses must be a positive multiple of alignment
-
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     // //printf("called tm_write (tx with id %u)\n", t->id);
@@ -805,15 +766,6 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
  **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 {
-    // TODO: tm_alloc(shared_t, tx_t, size_t, void**)
-
-    // allocate enough space for a segment of size size
-    // if allocation fails, return abort_alloc
-
-    // initialize the control structure(s) (one per word) in the segment;
-    // initialize each copy of each word in the segment to zeroes;
-    // register the segment in the set of allocated segments;
-
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     // //printf("called tm_alloc (tx with id %u)\n", t->id);
@@ -862,12 +814,6 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
  **/
 bool tm_free(shared_t shared, tx_t tx, void *target)
 {
-    // TODO: tm_free(shared_t, tx_t, void*)
-
-    // mark target for deregistering (from the set of allocated segments)
-    // and freeing once the last transaction of the current epoch leaves
-    // the Batcher, if the calling transaction ends up being committed;
-
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     // printf("called tm_free (tx with id %u)\n", t->id);
