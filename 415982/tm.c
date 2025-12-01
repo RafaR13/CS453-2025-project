@@ -324,11 +324,12 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
 
 // helpers mais importantes ----------------------------------------------------
 
-static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
+static bool read_word(region *r, tx_t tx, segment_node *segment, size_t word_index, void *target)
 {
     ctrl *c = &segment->control[word_index];
+    txrecord *t = get_transaction_record(tx);
 
-    if (t == read_only_tx)
+    if (tx == read_only_tx)
     {
         // read the readable copy into target
         bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
@@ -713,7 +714,7 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         if (si.word_index >= si.seg->words)
             return abort_tx(r, t);
 
-        if (!read_word(r, t, si.seg, si.word_index, out))
+        if (!read_word(r, tx, si.seg, si.word_index, out))
             return abort_tx(r, t);
     }
     // //printf("tm_read succeeded (tx with id %u and epoch %u)\n", t->id, t->epoch);

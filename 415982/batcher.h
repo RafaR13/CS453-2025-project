@@ -15,9 +15,8 @@ typedef struct batcher
     uint32_t remaining; // number of active transactions
     uint32_t waiting;   // threads waiting
 
-    bool completed_rw_txs;
-    bool started_rw_txs;
-    //  talvez flag de quantas txs rw entraram
+    uint32_t started_rw_txs;
+    uint32_t completed_rw_txs;
 } batcher;
 
 // API do batcher
