@@ -23,7 +23,7 @@ uint64_t enter_batcher(batcher *bat, bool is_ro)
 
     if (bat->remaining == 0 ||
         bat->started_rw_txs == 0 ||
-        (is_ro && bat->completed_rw_txs == 0))
+        (/*is_ro && */ bat->completed_rw_txs == 0))
     {
         bat->remaining++;
         if (!is_ro)

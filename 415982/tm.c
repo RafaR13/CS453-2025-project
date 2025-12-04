@@ -355,7 +355,7 @@ static bool read_word(region *r, tx_t tx, segment_node *segment, size_t word_ind
     return true;
 }
 
-static bool write_word(region *r, txrecord *t, segment_node *segment, ctrl *c, size_t word_index, void const *source)
+static bool write_word(txrecord *t, ctrl *c)
 {
     // ctrl *c = &segment->control[word_index];
 
@@ -369,19 +369,8 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, ctrl *c, s
         if (!(ownerId == t->id && ownerEpoch == t->epoch))
             return false;
 
-        bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
-        memcpy(writable_ptr(segment, word_index, readable), source, r->align);
-        /*if (*same_copy != 3)
-        {
-            bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
-            bool writable_is_A = rc;
-
-            if (*same_copy == 0)
-                *same_copy = writable_is_A ? 1u : 2u;
-
-            else if ((*same_copy == 1 && !writable_is_A) || (*same_copy == 2 && writable_is_A))
-                *same_copy = 3u;
-        }*/
+        // bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+        // memcpy(writable_ptr(segment, word_index, readable), source, r->align);
         return true;
     }
 
@@ -403,17 +392,8 @@ static bool write_word(region *r, txrecord *t, segment_node *segment, ctrl *c, s
     c->written_this_epoch = t->epoch;
 
     // write to writable copy
-    bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
-    memcpy(writable_ptr(segment, word_index, readable), source, r->align);
-    /*if (*same_copy != 3)
-    {
-        bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
-        bool writable_is_A = rc;
-        if (*same_copy == 0)
-            *same_copy = writable_is_A ? 1u : 2u;
-        else if ((*same_copy == 1 && !writable_is_A) || (*same_copy == 2 && writable_is_A))
-            *same_copy = 3u;
-    }*/
+    // bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+    // memcpy(writable_ptr(segment, word_index, readable), source, r->align);
 
     c->next = t->written_head;
     t->written_head = c;
@@ -743,37 +723,22 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
     uint8_t const *in = (uint8_t const *)source;
     ctrl *c = &segment->control[start_index];
 
-    uint16_t same_copy = 0; // 0: neutro, 1: A, 2: B, 3: conflito
-
     // for each word index within [target, target+size[
-    for (size_t i = 0; i < words; ++i, ++c, ++si.word_index, in += r->align)
+    for (size_t i = 0; i < words; ++i, ++c)
     {
-        if (!write_word(r, t, si.seg, c, si.word_index, in))
+        if (!write_word(t, c))
             return abort_tx(r, t);
     }
 
-    /*// all ok, so we can actually do the memcpy
-    if (same_copy == 1u || same_copy == 2u)
+    // loop through words and write individually
+    for (size_t i = 0; i < words; ++i, in += r->align)
     {
-        bool writable_is_A = (same_copy == 1u);
+        size_t wi = si.word_index + i;
+        bool rc = atomic_load_explicit(&segment->control[wi].readable_copy, memory_order_relaxed);
+        bool writable_is_A = rc;
         uint8_t *base_ptr = writable_is_A ? segment->copyA : segment->copyB;
-        memcpy(base_ptr + (si.word_index * r->align), in, size);
+        memcpy(base_ptr + (wi * r->align), in, r->align);
     }
-    else if (same_copy == 3u)
-    {
-        // loop through words and write individually
-        for (size_t i = 0; i < words; ++i, in += r->align)
-        {
-            size_t wi = si.word_index + i;
-            bool rc = atomic_load_explicit(&segment->control[wi].readable_copy, memory_order_relaxed);
-            bool writable_is_A = rc;
-            uint8_t *base_ptr = writable_is_A ? segment->copyA : segment->copyB;
-            memcpy(base_ptr + (wi * r->align), in, r->align);
-        }
-    }
-    else
-        // should never happen
-        abort_tx(r, t);*/
 
     return true;
 }
