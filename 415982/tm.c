@@ -41,7 +41,6 @@ void epoch_boundary(void *ctx);
 #define WORD_INDEX_BITS 48u
 #define SEGMENT_ID_MASK (MAX_SEGMENTS - 1u)
 #define WORD_INDEX_MASK ((1ULL << WORD_INDEX_BITS) - 1ULL)
-static const tx_t read_only_tx = UINTPTR_MAX - 10;
 
 #define MAX_SEGMENTS (1u << SEGMENT_ID_BITS)
 #define BITSET_BYTES ((MAX_SEGMENTS + 7u) / 8u)
@@ -50,11 +49,10 @@ static const tx_t read_only_tx = UINTPTR_MAX - 10;
 
 typedef struct ctrl
 {
-    //_Atomic bool readable_copy;  // 0 if A, 1 if B
-    // uint32_t written_this_epoch; // if its equal to the current epoch, then someone has written this epoch
-    _Atomic uint64_t written_in_epoch_and_readable;
-    _Atomic uint64_t owner; // epoch || txid
-    struct ctrl *next;      // linked list of written words
+    _Atomic bool readable_copy;          // 0 if A, 1 if B
+    _Atomic uint32_t written_this_epoch; // if its equal to the current epoch, then someone has written this epoch
+    _Atomic uint64_t owner;              // epoch || txid
+    struct ctrl *next;                   // linked list of written words
 } ctrl;
 
 typedef struct segment_node
@@ -86,12 +84,14 @@ typedef struct segment_node *segment_list;
 
 typedef struct region
 {
-    uint32_t epoch;
     // batcher stuff
     batcher batcher;
     pthread_mutex_t written_lock;
     pthread_mutex_t free_lock;
-    pthread_mutex_t epoch_lock;
+    _Atomic uint32_t transaction_id_counter;
+
+    // write list
+    ctrl *write_list_head;
 
     segment_list allocs;       // list of dynamically allocated segments
     segment_list pending_free; // list of pending frees
@@ -163,21 +163,11 @@ static inline bool abort_tx(region *r, txrecord *t)
         return false;
     t->aborted = true;
 
-    if (t->is_ro)
-    {
-        free(t);
-        return false;
-    }
-
     ctrl *c = t->written_head;
     while (c)
     {
         ctrl *next = c->next;
-        // revert readable copy
-        uint64_t written_and_readable = atomic_load_explicit(&c->written_in_epoch_and_readable, memory_order_acquire);
-        uint64_t readable_copy = (written_and_readable & 0xFFFFFFFFu);
-        atomic_store_explicit(&c->written_in_epoch_and_readable, ((readable_copy + 1) & 0xFFFFFFFFu), memory_order_release);
-
+        atomic_store_explicit(&c->written_this_epoch, 0u, memory_order_relaxed);
         atomic_store_explicit(&c->owner, 0u, memory_order_relaxed);
         c->next = NULL;
         c = next;
@@ -217,15 +207,20 @@ static inline uint64_t get_byte_offset_from_pointer(const void *ptr)
 
 static bool address_to_segment_and_index(region *r, txrecord *t, const void *address, segment_and_index *out)
 {
-    // if (!r || !address || !out)
-    //    return false;
+    if (!r || !address || !out)
+        return false;
     uint16_t segment_id = get_segment_id_from_pointer(address);
-    uint64_t byte_offset = get_byte_offset_from_pointer(address);
 
+    uint64_t byte_offset = get_byte_offset_from_pointer(address);
     if ((byte_offset & (r->align - 1u)) != 0)
         return false;
 
-    segment_node *segment = r->segment_table[segment_id];
+    uint64_t word_index = byte_offset >> r->log2_align;
+
+    segment_node *segment = NULL;
+
+    // check region
+    segment = r->segment_table[segment_id];
 
     if (!segment && t)
     {
@@ -240,8 +235,10 @@ static bool address_to_segment_and_index(region *r, txrecord *t, const void *add
         }
     }
 
-    uint64_t word_index = byte_offset >> r->log2_align;
-    if (!segment || word_index >= segment->words)
+    if (!segment)
+        return false;
+
+    if (word_index >= segment->words)
         return false;
 
     out->seg = segment;
@@ -303,10 +300,11 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
 
     // zero data
     memset(sn->copyA, 0, size);
+    memset(sn->copyB, 0, size);
     for (size_t i = 0; i < words; i++)
     {
-        atomic_init(&sn->control[i].written_in_epoch_and_readable, 0u);
-
+        atomic_init(&sn->control[i].readable_copy, false);
+        atomic_init(&sn->control[i].written_this_epoch, 0u);
         atomic_init(&sn->control[i].owner, 0u);
         sn->control[i].next = NULL;
     }
@@ -321,30 +319,21 @@ static segment_node *allocate_segment(region *r, uint16_t id, size_t size)
 
 // helpers mais importantes ----------------------------------------------------
 
-static bool read_word(region *r, tx_t tx, segment_node *segment, size_t word_index, ctrl *c, void *target)
+static bool read_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void *target)
 {
-    // ctrl *c = &segment->control[word_index];
-    txrecord *t = get_transaction_record(tx);
-    uint64_t written_and_readable = atomic_load_explicit(&c->written_in_epoch_and_readable, memory_order_acquire);
-    uint32_t readable_copy = (uint32_t)(written_and_readable & 0xFFFFFFFFu);
-    uint32_t written_this_epoch = (uint32_t)(written_and_readable >> 32);
+    ctrl *c = &segment->control[word_index];
 
-    if (/*tx == read_only_tx*/ t->is_ro)
+    if (t->is_ro)
     {
         // read the readable copy into target
-        /*bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
-        if (c->written_this_epoch == t->epoch)
-            rc = !rc;*/
-
-        bool rc = readable_copy % 2 == 1;
-        if (written_this_epoch == t->epoch)
-            rc = !rc;
-
-        memcpy(target, readable_ptr(segment, word_index, rc), r->align);
+        bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
+        memcpy(target, readable_ptr(segment, word_index, readable), r->align);
         return true;
     }
 
-    if (written_this_epoch == t->epoch /* the word has been written in the current epoch*/)
+    uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+
+    if (written == t->epoch /* the word has been written in the current epoch*/)
     {
         uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
         uint32_t ownerEpoch = (uint32_t)(expected >> 32);
@@ -354,33 +343,30 @@ static bool read_word(region *r, tx_t tx, segment_node *segment, size_t word_ind
         if (!(ownerEpoch == t->epoch && ownerId == t->id))
             return false;
 
-        bool readable = readable_copy % 2 == 0;
+        // read the writable copy into target
+        bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
         memcpy(target, writable_ptr(segment, word_index, readable), r->align);
         return true;
     }
 
     // im now the owner (if there wasnt one already in this epoch)
 
-    // uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
-    // if ((uint32_t)(expected >> 32) != t->epoch)
-    //   atomic_compare_exchange_strong_explicit(&c->owner, &expected, ((uint64_t)t->epoch << 32) | t->id, memory_order_acq_rel, memory_order_acquire);
+    uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
+    if ((uint32_t)(expected >> 32) != t->epoch)
+        atomic_compare_exchange_strong_explicit(&c->owner, &expected, ((uint64_t)t->epoch << 32) | t->id, memory_order_acq_rel, memory_order_acquire);
 
     // read the readable copy into target
-    // bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
-    bool rc = readable_copy % 2 == 1;
+    bool rc = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(target, readable_ptr(segment, word_index, rc), r->align);
     return true;
 }
 
-static bool write_word(region *r, txrecord *t, ctrl *c, segment_node *segment, size_t word_index, const void *source)
+static bool write_word(region *r, txrecord *t, segment_node *segment, size_t word_index, void const *source)
 {
-    // ctrl *c = &segment->control[word_index];
+    ctrl *c = &segment->control[word_index];
 
-    uint64_t written_and_readable = atomic_load_explicit(&c->written_in_epoch_and_readable, memory_order_acquire);
-    uint32_t readable_copy = (uint32_t)(written_and_readable & 0xFFFFFFFFu);
-    uint32_t written_this_epoch = (uint32_t)(written_and_readable >> 32);
-
-    if (written_this_epoch == t->epoch)
+    uint32_t written = atomic_load_explicit(&c->written_this_epoch, memory_order_acquire);
+    if (written == t->epoch)
     {
         uint64_t expected = atomic_load_explicit(&c->owner, memory_order_acquire);
         uint32_t ownerEpoch = (uint32_t)(expected >> 32);
@@ -389,8 +375,7 @@ static bool write_word(region *r, txrecord *t, ctrl *c, segment_node *segment, s
         if (!(ownerId == t->id && ownerEpoch == t->epoch))
             return false;
 
-        // bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
-        bool readable = readable_copy % 2 == 0;
+        bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
         memcpy(writable_ptr(segment, word_index, readable), source, r->align);
         return true;
     }
@@ -410,13 +395,10 @@ static bool write_word(region *r, txrecord *t, ctrl *c, segment_node *segment, s
         return false;
 
     // mark that the word has been written this epoch
-    // c->written_this_epoch = t->epoch;
-    atomic_store_explicit(&c->written_in_epoch_and_readable, (((uint64_t)t->epoch << 32) | (readable_copy + 1)), memory_order_release);
+    atomic_store_explicit(&c->written_this_epoch, t->epoch, memory_order_release);
 
     // write to writable copy
-    // bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
-    // atomic_store_explicit(&c->readable_copy, readable, memory_order_release);
-    bool readable = readable_copy % 2 == 1;
+    bool readable = atomic_load_explicit(&c->readable_copy, memory_order_acquire);
     memcpy(writable_ptr(segment, word_index, readable), source, r->align);
 
     c->next = t->written_head;
@@ -431,9 +413,18 @@ void epoch_boundary(void *ctx)
 {
     region *r = (region *)ctx;
 
-    pthread_mutex_lock(&r->epoch_lock);
-    r->epoch++;
-    pthread_mutex_unlock(&r->epoch_lock);
+    // writes
+    ctrl *whead = r->write_list_head;
+    while (whead)
+    {
+        ctrl *c = whead;
+        whead = whead->next;
+        bool rc = atomic_load_explicit(&c->readable_copy, memory_order_relaxed);
+        atomic_store_explicit(&c->readable_copy, !rc, memory_order_relaxed);
+
+        c->next = NULL;
+    }
+    r->write_list_head = NULL;
 
     // 2) libertar segments
     segment_node *head = r->pending_free;
@@ -443,9 +434,7 @@ void epoch_boundary(void *ctx)
         segment_node *sn = head;
         head = head->next_free;
 
-        // corta encadeamento e (por segurança) limpa flag
         sn->next_free = NULL;
-        // TODO: maybe unnecessary
 
         // remove de estruturas (allocs/segment_table) e libera memória
         if (sn->prev)
@@ -494,6 +483,7 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
     atomic_init(&region->segment_count, 2);
+    atomic_init(&region->transaction_id_counter, 1);
 
     // base segment
     segment_node *base = allocate_segment(region, 1, size);
@@ -504,13 +494,12 @@ shared_t tm_create(size_t unused(size), size_t unused(align))
         return invalid_shared;
     }
     region->segment_table[1] = base;
+    region->write_list_head = NULL;
 
     // initialize batcher
     batcher_init(&region->batcher);
     pthread_mutex_init(&region->written_lock, NULL);
     pthread_mutex_init(&region->free_lock, NULL);
-    region->epoch = 1;
-    pthread_mutex_init(&region->epoch_lock, NULL);
     region->allocs = base;
     region->pending_free = NULL;
 
@@ -537,7 +526,6 @@ void tm_destroy(shared_t shared)
     batcher_destroy(&region->batcher);
     pthread_mutex_destroy(&region->written_lock);
     pthread_mutex_destroy(&region->free_lock);
-    pthread_mutex_destroy(&region->epoch_lock);
     // segment table
     free(region->segment_table);
     // region
@@ -580,12 +568,6 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 {
     region *r = (region *)shared;
 
-    /*if (is_ro)
-    {
-        enter_batcher(&r->batcher, true);
-        return read_only_tx;
-    }*/
-
     txrecord *t = (txrecord *)malloc(sizeof(txrecord));
     if (unlikely(!t))
         return invalid_tx;
@@ -598,18 +580,11 @@ tx_t tm_begin(shared_t shared, bool is_ro)
     t->written_head = NULL;
     t->written_tail = NULL;
 
-    if (is_ro)
-    {
-        pthread_mutex_lock(&r->epoch_lock);
-        t->epoch = r->epoch;
-        pthread_mutex_unlock(&r->epoch_lock);
-        t->id = 0;
-        return (tx_t)t;
-    }
-
-    uint64_t id_and_epoch = enter_batcher(&r->batcher, is_ro);
-    t->epoch = (uint32_t)(id_and_epoch & 0xFFFFFFFFu);
-    t->id = (uint32_t)(id_and_epoch >> 32);
+    t->epoch = enter_batcher(&r->batcher, is_ro);
+    uint32_t id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
+    if (id == 0)
+        id = atomic_fetch_add_explicit(&r->transaction_id_counter, 1, memory_order_relaxed);
+    t->id = id;
     return (tx_t)t;
 }
 
@@ -621,68 +596,61 @@ tx_t tm_begin(shared_t shared, bool is_ro)
 bool tm_end(shared_t shared, tx_t tx)
 {
     region *r = (region *)shared;
-    /*if (tx == read_only_tx)
-    {
-        leave_batcher(&r->batcher, r, true);
-        return true;
-    }*/
     txrecord *t = get_transaction_record(tx);
+    bool committed = !t->aborted;
 
-    if (t->is_ro)
+    if (committed)
     {
-        pthread_mutex_lock(&r->epoch_lock);
-        uint32_t current_epoch = r->epoch;
-        pthread_mutex_unlock(&r->epoch_lock);
-        if (t->epoch != current_epoch)
+        if (t->free_map)
         {
-            // abort
-            free(t);
-            return false;
-        }
-        free(t);
-        return true;
-    }
-
-    if (t->free_map)
-    {
-        for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
-        {
-            uint64_t bm = t->free_map[i];
-            if (!bm)
-                continue;
-            const uint32_t base = i << 6;
-            while (bm)
+            for (uint32_t i = 0; i < MAX_SEGMENTS / 64; ++i)
             {
-                unsigned b = (unsigned)__builtin_ctzll(bm);
-                uint16_t seg = (uint16_t)(base + b);
-                segment_node *sn = r->segment_table[seg];
-                if (sn)
-                    add_pending_free(r, sn);
-                bm &= (bm - 1);
+                uint64_t bm = t->free_map[i];
+                if (!bm)
+                    continue;
+                const uint32_t base = i << 6;
+                while (bm)
+                {
+                    unsigned b = (unsigned)__builtin_ctzll(bm);
+                    uint16_t seg = (uint16_t)(base + b);
+                    segment_node *sn = r->segment_table[seg];
+                    if (sn)
+                        add_pending_free(r, sn);
+                    bm &= (bm - 1);
+                }
             }
         }
-    }
 
-    // alocs
-    segment_node *sn = t->allocated_segments;
-    while (sn)
-    {
-        segment_node *next = sn->next;
-        r->segment_table[sn->id] = sn;
-        sn->prev = NULL;
-        sn->next = r->allocs;
-        if (sn->next)
-            sn->next->prev = sn;
-        r->allocs = sn;
-        sn = next;
+        // writes
+        if (t->written_head)
+        {
+            pthread_mutex_lock(&r->written_lock);
+            t->written_tail->next = r->write_list_head;
+            r->write_list_head = t->written_head;
+            pthread_mutex_unlock(&r->written_lock);
+        }
+
+        // alocs
+        segment_node *sn = t->allocated_segments;
+        while (sn)
+        {
+            segment_node *next = sn->next;
+            r->segment_table[sn->id] = sn;
+            sn->prev = NULL;
+            sn->next = r->allocs;
+            if (sn->next)
+                sn->next->prev = sn;
+            r->allocs = sn;
+            sn = next;
+        }
+        t->allocated_segments = NULL;
     }
-    t->allocated_segments = NULL;
 
     leave_batcher(&r->batcher, r, t->is_ro);
     if (t->free_map)
         free(t->free_map);
     free(t);
-    return true;
+    return committed;
 }
 
 /** [thread-safe] Read operation in the given transaction, source in the shared region and target in a private region.
@@ -706,19 +674,15 @@ bool tm_read(shared_t shared, tx_t tx, void const *source, size_t size, void *ta
         return abort_tx(r, t);
 
     size_t words = size / r->align;
-    segment_node *segment = si.seg;
-    size_t start_index = si.word_index;
     uint8_t *out = (uint8_t *)target;
 
-    if (si.word_index + words > si.seg->words)
-        return abort_tx(r, t);
-
-    ctrl *c = &segment->control[start_index];
-
     // for each word index within [source, source + size[
-    for (size_t i = 0; i < words; ++i, ++c, ++start_index, out += r->align)
+    for (size_t i = 0; i < words; ++i, ++si.word_index, out += r->align)
     {
-        if (!read_word(r, tx, si.seg, start_index, c, out))
+        if (si.word_index >= si.seg->words)
+            return abort_tx(r, t);
+
+        if (!read_word(r, t, si.seg, si.word_index, out))
             return abort_tx(r, t);
     }
     return true;
@@ -745,32 +709,17 @@ bool tm_write(shared_t shared, tx_t tx, void const *source, size_t size, void *t
         return abort_tx(r, t);
 
     size_t words = size / r->align;
-    segment_node *segment = si.seg;
-    size_t start_index = si.word_index;
-
-    if (si.word_index + words > si.seg->words)
-        return abort_tx(r, t);
-
     uint8_t const *in = (uint8_t const *)source;
-    ctrl *c = &segment->control[start_index];
 
     // for each word index within [target, target+size[
-    for (size_t i = 0; i < words; ++i, ++c, in += r->align)
+    for (size_t i = 0; i < words; ++i, ++si.word_index, in += r->align)
     {
-        if (!write_word(r, t, c, segment, start_index + i, in))
+        if (si.word_index >= si.seg->words)
+            return abort_tx(r, t);
+
+        if (!write_word(r, t, si.seg, si.word_index, in))
             return abort_tx(r, t);
     }
-
-    // loop through words and write individually
-    /*for (size_t i = 0; i < words; ++i, in += r->align)
-    {
-        size_t wi = si.word_index + i;
-        bool rc = atomic_load_explicit(&segment->control[wi].readable_copy, memory_order_relaxed);
-        bool writable_is_A = rc;
-        uint8_t *base_ptr = writable_is_A ? segment->copyA : segment->copyB;
-        memcpy(base_ptr + (wi * r->align), in, r->align);
-    }*/
-
     return true;
 }
 
@@ -798,9 +747,7 @@ alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void **target)
 
     uint16_t segment_id = atomic_fetch_add_explicit(&r->segment_count, 1, memory_order_acq_rel);
     if (segment_id >= MAX_SEGMENTS)
-    {
         return nomem_alloc;
-    }
 
     segment_node *sn = allocate_segment(r, segment_id, size);
     if (!sn)
@@ -826,10 +773,11 @@ bool tm_free(shared_t shared, tx_t tx, void *target)
     region *r = (region *)shared;
     txrecord *t = get_transaction_record(tx);
     if (!r || !target || !t)
+
         return abort_tx(r, t);
 
     uint16_t segment_id = get_segment_id_from_pointer(target);
-    if (segment_id < 2) // base
+    if (segment_id < 2)
         return abort_tx(r, t);
 
     // check if its still a local aloc
