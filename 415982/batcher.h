@@ -10,13 +10,14 @@ typedef struct batcher
     pthread_mutex_t lock;
     pthread_cond_t cond;
 
-    uint32_t counter; // current epoch
-    uint32_t tx_id_counter;
+    uint32_t counter;   // current epoch
     uint32_t remaining; // number of active transactions
     uint32_t waiting;   // threads waiting
 
-    uint32_t started_rw_txs;
-    uint32_t completed_rw_txs;
+    uint32_t tx_counter;
+
+    bool completed_rw_txs;
+    //  talvez flag de quantas txs rw entraram
 } batcher;
 
 // API do batcher
